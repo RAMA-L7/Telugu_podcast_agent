@@ -1,0 +1,33 @@
+# Core
+python-dotenv==1.0.1
+
+# Google Sheets + Drive
+gspread==6.1.2
+google-api-python-client==2.143.0
+google-auth==2.35.0
+google-auth-oauthlib==1.2.1
+
+# YouTube
+youtube-transcript-api==0.6.2
+yt-dlp==2024.10.7
+pytube==15.0.0
+
+# LLM providers — ALL OPTIONAL — basic workflow & sheet test need NONE
+# Rule-based Python fallback is default; Ollama/OpenAI only if you opt in.
+# Install only what you need: pip install openai / google-generativeai / groq
+openai==1.52.0  # optional — only if LLM_PROVIDER=openai (OPENAI_API_KEY set)
+google-generativeai==0.5.4  # optional — only if LLM_PROVIDER=gemini
+groq==0.9.0  # optional — only if LLM_PROVIDER=groq
+requests==2.32.3  # for Ollama (optional) and general HTTP
+
+# Telugu TTS
+edge-tts==6.1.10
+gTTS==2.5.3
+pydub==0.25.1
+# Optional offline engines - uncomment if needed:
+# TTS==0.22.0
+# piper-tts==1.2.0
+
+# Utils
+tenacity==8.5.0
+tqdm==4.66.5

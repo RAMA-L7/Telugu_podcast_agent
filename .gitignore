@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.env
+credentials/*.json
+credentials/*.pickle
+!credentials/README.md
+output/*.mp3
+output/*.wav
+output/*.json
+output/*.log
+!output/.gitkeep
+.DS_Store
+Thumbs.db
