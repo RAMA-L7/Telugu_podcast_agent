@@ -56,6 +56,10 @@ POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "60"))
 MAX_TRANSCRIPT_CHARS = int(os.getenv("MAX_TRANSCRIPT_CHARS", "12000"))
 MAX_PODCAST_TURNS = int(os.getenv("MAX_PODCAST_TURNS", "14"))
 
+# Transcripts — saved locally under output/transcripts/, never committed
+TRANSCRIPT_DIR = OUTPUT_DIR / "transcripts"
+TRANSCRIPT_DIR.mkdir(parents=True, exist_ok=True)
+
 TTS_ENGINE = os.getenv("TTS_ENGINE", "edge").lower()
 PIPER_BINARY_PATH = os.getenv("PIPER_BINARY_PATH", "")
 PIPER_MODEL_PATH_TE_FEMALE = os.getenv("PIPER_MODEL_PATH_TE_FEMALE", "")

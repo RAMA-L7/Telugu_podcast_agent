@@ -10,6 +10,10 @@ output/*.mp3
 output/*.wav
 output/*.json
 output/*.log
+output/transcripts/*.txt
+output/transcripts/*.json
+output/transcripts/*.log
 !output/.gitkeep
+!output/transcripts/.gitkeep
 .DS_Store
 Thumbs.db
