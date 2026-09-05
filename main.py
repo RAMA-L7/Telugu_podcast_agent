@@ -96,6 +96,8 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="Skip Drive upload and sheet update")
     parser.add_argument("--poll-interval", type=int, default=None, help="Override POLL_INTERVAL_SECONDS")
     parser.add_argument("--test-sheet", action="store_true", help="Sheet connection test: NEW -> TEST_OK + Updated At (no transcript/audio)")
+    parser.add_argument("--run-transcripts", action="store_true", help="Milestone 3: process rows NEW/TEST_OK -> fetch transcript -> TRANSCRIPT_DONE/FAILED (use --dry-run to preview)")
+    parser.add_argument("--limit", type=int, default=None, help="Limit rows processed (with --run-transcripts/--test-sheet)")
     args = parser.parse_args()
 
     # Sheet connection test mode (focused step, no transcript/audio)
@@ -110,6 +112,20 @@ def main():
             print("Dry-run: no writes performed.")
         else:
             print(f"Updated to TEST_OK: {result['updated']} @ {result.get('timestamp','')}")
+        return
+
+    # Milestone 3: transcript pipeline
+    if args.run_transcripts:
+        from src.sheet_monitor import run_transcript_pipeline
+        summary = run_transcript_pipeline(dry_run=args.dry_run, limit=args.limit)
+        print("\n=== Transcript Pipeline Result ===")
+        print(f"Pending (NEW/TEST_OK): {summary['total_pending']} | Done: {summary['done']} | Failed: {summary['failed']} | dry_run={summary['dry_run']}")
+        for d in summary["details"]:
+            rid = d.get("row_num")
+            if d.get("valid"):
+                print(f"  Row {rid}: TRANSCRIPT_DONE vid={d.get('video_id')} -> {d.get('transcript_link')}")
+            else:
+                print(f"  Row {rid}: TRANSCRIPT_FAILED [{d.get('error_type')}] {str(d.get('error',''))[:100]}")
         return
 
     # Single URL mode

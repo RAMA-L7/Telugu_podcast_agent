@@ -135,6 +135,162 @@ def fetch_all_pending(ws=None) -> List[Dict]:
             pending.append({"row_num": idx, "url": yt_link, "youtube_link": yt_link, "status": status, "record": row})
     return pending
 
+# ---------------------------------------------------------------------------
+# Milestone 3: Transcript pipeline — connect sheet rows to transcript module
+# ---------------------------------------------------------------------------
+def fetch_transcript_pending_rows(ws=None) -> List[Dict]:
+    """Milestone 3: rows with Status NEW or TEST_OK (sheet -> transcript).
+
+    Reads YouTube Link from exact 12-col schema. Returns rows where
+    Status (trimmed, upper) is NEW or TEST_OK. Any YouTube Link value is
+    returned (empty/invalid will be handled as TRANSCRIPT_FAILED, not skipped).
+    """
+    ws = ws or get_sheet()
+    records = ws.get_all_records()
+    pending = []
+    for idx, row in enumerate(records, start=2):
+        status = str(row.get("Status", "")).strip().upper()
+        if status in ("NEW", "TEST_OK"):
+            yt_link = str(row.get("YouTube Link", "")).strip()
+            pending.append({
+                "row_num": idx,
+                "status": status,
+                "record": row,
+                "url": yt_link,
+                "youtube_link": yt_link,
+                "id": str(row.get("ID", "")).strip(),
+            })
+    return pending
+
+def _ist_timestamp() -> str:
+    from datetime import datetime, timezone, timedelta
+    ist = timezone(timedelta(hours=5, minutes=30))
+    return datetime.now(ist).strftime("%Y-%m-%d %H:%M:%S IST")
+
+def process_transcript_row(ws, row: Dict, dry_run: bool = False) -> Dict:
+    """Process one row: validate YouTube Link, fetch transcript, save locally.
+
+    Sheet-safe:
+      - On valid: saves to output/transcripts/<video_id>.{txt,json}, then
+        updates sheet Transcript Link + Title + Status=TRANSCRIPT_DONE + clear Error + Updated At
+      - On invalid/empty/fetch failure: does NOT write Transcript Link; sets
+        Status=TRANSCRIPT_FAILED + Error (truncated) + Updated At
+      - On dry_run: does everything except ws.update_cell (logs what would happen)
+
+    Returns result dict with row_num, status, valid, error etc.
+    """
+    from src.transcript import fetch_and_save_transcript
+    row_num = row["row_num"]
+    yt_link = row.get("youtube_link", row.get("url", ""))
+    orig_status = row.get("status", "")
+    log.info("Row %d (Status=%s) -> YouTube Link=%r", row_num, orig_status, yt_link)
+
+    result = fetch_and_save_transcript(yt_link)
+    timestamp = _ist_timestamp()
+
+    if result["valid"]:
+        txt_path = result["txt_path"]
+        # Store relative path for sheet (portable) — e.g. output/transcripts/<id>.txt
+        try:
+            rel = txt_path.relative_to(config.BASE_DIR)
+        except Exception:
+            rel = txt_path
+        transcript_link = str(rel).replace("\\", "/")
+        title = result.get("title", "") or str(row["record"].get("Title", "")).strip()
+        # On success: clear Error, set DONE, fill Title/Transcript Link, Updated At
+        if dry_run:
+            log.info("[DRY-RUN] Row %d would -> TRANSCRIPT_DONE | Transcript Link=%s | Title=%r | Updated At=%s",
+                     row_num, transcript_link, title[:40], timestamp)
+            return {"row_num": row_num, "youtube_link": yt_link, "valid": True, "dry_run": True,
+                    "would_status": "TRANSCRIPT_DONE", "transcript_link": transcript_link, "title": title,
+                    "video_id": result["video_id"], "error": None}
+        # Real write — only when valid data exists
+        updates = {}
+        # Title
+        if title:
+            ws.update_cell(row_num, _col_index("Title"), title[:180])
+            updates["Title"] = title[:180]
+        # Transcript Link
+        ws.update_cell(row_num, _col_index("Transcript Link"), transcript_link)
+        updates["Transcript Link"] = transcript_link
+        # Clear Error on success
+        ws.update_cell(row_num, _col_index("Error"), "")
+        # Status + Updated At last
+        ws.update_cell(row_num, _col_index("Status"), "TRANSCRIPT_DONE")
+        ws.update_cell(row_num, _col_index("Updated At"), timestamp)
+        log.info("Row %d -> TRANSCRIPT_DONE (%s)", row_num, result["video_id"])
+        return {"row_num": row_num, "youtube_link": yt_link, "valid": True, "status": "TRANSCRIPT_DONE",
+                "transcript_link": transcript_link, "video_id": result["video_id"], "title": title, "timestamp": timestamp, "updates": updates}
+    else:
+        err = (result.get("error") or "Unknown error")[:300]
+        err_type = result.get("error_type", "Unknown")
+        log.warning("Row %d -> TRANSCRIPT_FAILED [%s] %s", row_num, err_type, err[:120])
+        if dry_run:
+            log.info("[DRY-RUN] Row %d would -> TRANSCRIPT_FAILED | Error=[%s] %s | Updated At=%s",
+                     row_num, err_type, err[:80], timestamp)
+            return {"row_num": row_num, "youtube_link": yt_link, "valid": False, "dry_run": True,
+                    "would_status": "TRANSCRIPT_FAILED", "error": err, "error_type": err_type}
+        # Real write for failure: do NOT overwrite Transcript Link; set Error + Status + Updated At
+        ws.update_cell(row_num, _col_index("Error"), f"[{err_type}] {err}"[:300])
+        ws.update_cell(row_num, _col_index("Status"), "TRANSCRIPT_FAILED")
+        ws.update_cell(row_num, _col_index("Updated At"), timestamp)
+        return {"row_num": row_num, "youtube_link": yt_link, "valid": False, "status": "TRANSCRIPT_FAILED",
+                "error": err, "error_type": err_type, "timestamp": timestamp}
+
+def run_transcript_pipeline(dry_run: bool = False, limit: Optional[int] = None, ws=None) -> Dict:
+    """Milestone 3 entry: process all rows with NEW or TEST_OK.
+
+    - Reads pending rows via fetch_transcript_pending_rows()
+    - For each, calls process_transcript_row (which validates, fetches, saves locally)
+    - On dry_run: no sheet writes, only logs
+    - Returns summary dict.
+
+    Does NOT touch .env / credentials; sheet writes only when valid or for
+    explicit FAILED status+Error.
+
+    Usage:
+        from src.sheet_monitor import run_transcript_pipeline
+        run_transcript_pipeline(dry_run=True)   # preview
+        run_transcript_pipeline(dry_run=False)  # live
+    """
+    ws = ws or get_sheet()
+    header = ws.row_values(1)
+    if header != config.SHEET_HEADER:
+        log.warning("Header mismatch for transcript pipeline — continuing without modification. Expected %s", config.SHEET_HEADER)
+    pending = fetch_transcript_pending_rows(ws)
+    log.info("Transcript pipeline: %d rows with Status NEW/TEST_OK", len(pending))
+    if limit is not None:
+        pending = pending[:limit]
+        log.info("Limited to first %d rows", limit)
+    summary = {
+        "header": header,
+        "total_pending": len(pending),
+        "processed": 0,
+        "done": 0,
+        "failed": 0,
+        "dry_run": dry_run,
+        "details": [],
+    }
+    if not pending:
+        log.info("No rows to process (need Status NEW or TEST_OK with YouTube Link)")
+        return summary
+    for row in pending:
+        try:
+            res = process_transcript_row(ws, row, dry_run=dry_run)
+            summary["details"].append(res)
+            summary["processed"] += 1
+            if res.get("valid"):
+                summary["done"] += 1
+            else:
+                summary["failed"] += 1
+        except Exception as e:
+            log.exception("Unexpected error processing row %d: %s", row["row_num"], e)
+            summary["details"].append({"row_num": row["row_num"], "valid": False, "error": str(e), "error_type": "Unexpected"})
+            summary["failed"] += 1
+            summary["processed"] += 1
+    log.info("Transcript pipeline complete: %d done, %d failed (dry_run=%s)", summary["done"], summary["failed"], dry_run)
+    return summary
+
 def update_row(ws, row_num: int, status: str = "", drive_link: str = "", title: str = "", updated_at: str = "", error: str = "", **kwargs):
     """Update row by exact 12-column header names.
 
