@@ -206,11 +206,18 @@ def upload_to_drive(
     media = MediaFileUpload(str(file_path), mimetype=mimetype, resumable=True)
 
     log.info("Uploading %s to Drive (folder=%s, make_public=%s)...", file_path.name, resolved_folder or "root (My Drive)", make_public)
-    try:
-        uploaded = service.files().create(
+
+    def _do_upload():
+        return service.files().create(
             body=file_metadata, media_body=media, fields="id, webViewLink, webContentLink"
         ).execute()
+
+    # Retry transient Drive/network failures with exponential backoff (not permanent errors like FileNotFound)
+    try:
+        from src.retry_utils import retry_operation
+        uploaded = retry_operation(_do_upload, operation_name=f"Drive upload {file_path.name}")
     except Exception as e:
+        # retry_operation already handled transient retries; now it's a permanent or exhausted transient
         raise DriveUploadError(f"Drive upload failed for {file_path.name}: {e}") from e
 
     file_id = uploaded.get("id")

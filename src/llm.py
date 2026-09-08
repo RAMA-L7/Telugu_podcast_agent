@@ -274,15 +274,26 @@ def generate(
     mdl = (model or get_model(prov)).strip()
 
     log.info("LLM generate provider=%s model=%s timeout=%s prompt_len=%d", prov, mdl, timeout, len(prompt))
-    if prov == "ollama":
-        return _call_ollama(prompt, system=system, model=mdl, timeout=timeout)
-    if prov == "openai":
-        return _call_openai(prompt, system=system, model=mdl, timeout=timeout)
-    if prov == "gemini":
-        return _call_gemini(prompt, system=system, model=mdl, timeout=timeout)
-    if prov == "groq":
-        return _call_groq(prompt, system=system, model=mdl, timeout=timeout)
-    raise LLMProviderError(f"Unknown LLM provider: {prov!r} (expected ollama|openai|gemini|groq)")
+    # Retry transient LLM failures (e.g., 429, 5xx, timeout) with exponential backoff, not permanent (e.g., missing key)
+    def _do_generate():
+        if prov == "ollama":
+            return _call_ollama(prompt, system=system, model=mdl, timeout=timeout)
+        if prov == "openai":
+            return _call_openai(prompt, system=system, model=mdl, timeout=timeout)
+        if prov == "gemini":
+            return _call_gemini(prompt, system=system, model=mdl, timeout=timeout)
+        if prov == "groq":
+            return _call_groq(prompt, system=system, model=mdl, timeout=timeout)
+        raise LLMProviderError(f"Unknown LLM provider: {prov!r} (expected ollama|openai|gemini|groq)")
+
+    # Use retry for transient errors only
+    try:
+        from src.retry_utils import retry_operation, is_transient_error
+        # Only retry if error is transient; is_transient_error handles permanent vs transient
+        return retry_operation(_do_generate, operation_name=f"LLM {prov}/{mdl}")
+    except Exception:
+        # If retry not available or fails, fall back to direct call (should not happen)
+        return _do_generate()
 
 # Convenience: check if currently configured provider is available (for CLI)
 def is_provider_available(timeout: int = 5) -> bool:

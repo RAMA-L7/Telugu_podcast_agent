@@ -323,11 +323,52 @@ def _is_valid_audio_link(link: str) -> bool:
     link = (link or "").strip()
     return link.startswith("http") and "drive.google.com" in link
 
+def _should_retry_failed_row(record: Dict) -> bool:
+    """Prevent hammering permanently failing rows (Phase 5.3).
+
+    Uses Updated At (IST timestamp like "2026-09-08 12:02:43 IST") to decide if enough time has passed
+    since last failure. No schema change — uses existing Updated At / Error columns.
+
+    - If status is TRANSCRIPT_FAILED/AUDIO_FAILED and Updated At is recent, skip this cycle
+    - If Updated At missing/unparsable, allow retry (safe)
+    - Uses max(WATCH_INTERVAL*2, RETRY_MAX_DELAY) as minimum retry interval to avoid 30s hammering
+    - Simple, backward-compatible, survives watcher restart via sheet timestamp
+    """
+    status = str(record.get("Status", "")).strip().upper()
+    if status not in ("TRANSCRIPT_FAILED", "AUDIO_FAILED"):
+        return True  # Not a failed row, always retryable (e.g., NEW, TRANSCRIPT_DONE)
+    updated_at = str(record.get("Updated At", "")).strip()
+    if not updated_at:
+        return True
+    try:
+        from datetime import datetime, timezone, timedelta
+        # Parse "YYYY-MM-DD HH:MM:SS IST" — IST is UTC+5:30
+        ist = timezone(timedelta(hours=5, minutes=30))
+        # Remove trailing " IST" if present
+        ts_str = updated_at.replace(" IST", "").strip()
+        dt = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
+        dt = dt.replace(tzinfo=ist)
+        now = datetime.now(ist)
+        elapsed = (now - dt).total_seconds()
+        # Use max of watch interval *2 and retry max delay as backoff
+        # This prevents hammering every 30s, but allows retry after ~60s
+        try:
+            min_interval = max(int(config.WATCH_INTERVAL_SECONDS) * 2, int(config.RETRY_MAX_DELAY_SECONDS))
+        except Exception:
+            min_interval = 60
+        if elapsed < min_interval:
+            log.debug("Skipping retry for %s row %r (Updated At %s, %.0fs ago < %ds)", status, record.get("ID"), updated_at, elapsed, min_interval)
+            return False
+        return True
+    except Exception as e:
+        log.debug("Could not parse Updated At %r, allowing retry: %s", updated_at, e)
+        return True
+
 def fetch_audio_pending_rows(ws=None) -> List[Dict]:
     """Fetch rows ready for audio generation/upload.
 
     Idempotency: skip rows where Status == AUDIO_DONE and Audio Link is valid Drive link.
-    Pending if Status in (TRANSCRIPT_DONE, AUDIO_FAILED) — AUDIO_FAILED is retryable.
+    Pending if Status in (TRANSCRIPT_DONE, AUDIO_FAILED) — AUDIO_FAILED is retryable with backoff.
     Uses exact 12-col schema, no header change.
 
     Returns list of dicts with row_num, status, record, url, youtube_link, id, title, audio_link.
@@ -341,7 +382,10 @@ def fetch_audio_pending_rows(ws=None) -> List[Dict]:
         # Idempotency: already AUDIO_DONE with valid link → skip
         if status == "AUDIO_DONE" and _is_valid_audio_link(audio_link):
             continue
-        # Pending: transcript done, or previous audio failed (retryable)
+        # Hammering prevention: don't retry failed rows every 30s
+        if status in ("AUDIO_FAILED", "TRANSCRIPT_FAILED") and not _should_retry_failed_row(row):
+            continue
+        # Pending: transcript done, or previous audio failed (retryable with backoff)
         if status in ("TRANSCRIPT_DONE", "AUDIO_FAILED"):
             yt_link = str(row.get("YouTube Link", "")).strip()
             pending.append({
@@ -620,6 +664,9 @@ def fetch_pipeline_pending_rows(ws=None) -> List[Dict]:
         audio_link = str(row.get("Audio Link", "")).strip()
         # Idempotency: already done with valid link -> skip
         if status == "AUDIO_DONE" and _is_valid_audio_link(audio_link):
+            continue
+        # Hammering prevention: don't retry failed rows every cycle
+        if status in ("AUDIO_FAILED", "TRANSCRIPT_FAILED") and not _should_retry_failed_row(row):
             continue
         # Primary NEW, plus transcript done for restart, plus audio failed retry
         # Also include TEST_OK for backward compat (transcript pipeline uses it)

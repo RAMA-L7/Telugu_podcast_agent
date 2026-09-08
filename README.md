@@ -274,6 +274,15 @@ Outputs: `output/transcripts/<id>.txt|.json`, `output/<id>.mp3|.json`, `output/a
 
 Watcher notes: polls via `src/watcher.py` → `src/sheet_monitor.run_pipeline()` (respects `TRANSCRIPT_DONE`/`AUDIO_FAILED` retry, skips `AUDIO_DONE+valid Drive link`, no duplicate uploads), logs startup/interval/cycle/pending/row IDs/done/failed/skipped/next cycle/shutdown (ASCII-safe), transient Sheets/API errors logged and retried next cycle, `WATCH_INTERVAL_SECONDS` in `.env` (default 30) overridden by `--interval`.
 
+**Phase 5.3 — Reliability (retry/backoff, hammering prevention, operational hardening):**
+- **Retry:** `MAX_RETRIES=3`, `RETRY_BASE_DELAY_SECONDS=2`, `RETRY_MAX_DELAY_SECONDS=30` (exponential backoff `base*2^attempt` capped at max) for transient `429/5xx/timeout` (Sheets/Drive/Gemini). Permanent errors (`EmptyLinkError`, `InvalidLinkError`, missing file, bad credentials) not retried.
+- **Hammering prevention:** `TRANSCRIPT_FAILED`/`AUDIO_FAILED` rows not retried every 30s; uses `Updated At` (`IST`) + `max(WATCH_INTERVAL*2, RETRY_MAX_DELAY)` (~60s) to throttle — no schema change, survives restart via sheet timestamp, in-memory per-cycle.
+- **Watcher:** `src/watcher.py` thin, calls `run_pipeline` only, startup logs `watcher start time, cycle, interval, mode, limit, elapsed`, per-cycle `pending/done/failed/skipped, row IDs, failure category [TranscriptFailed]/[LLMFailed]/[TTSFailed]/[DriveFailed]/[SheetFailed], next interval`, transient errors logged with backoff (`2s→4s→8s→30s`), no tight loop, one bad row doesn't stop others, `Ctrl+C` → `Stopped by user` exit 0.
+- **Auth:** Drive OAuth separate from Sheets service-account (`credentials/drive_oauth_client.json` vs `credentials/service_account.json`), safe messages (`No Drive OAuth client at ... Create OAuth client ID...`), no secret leakage (`[REDACTED]`), no hammering on permanent auth failure (backoff `RETRY_MAX`).
+- **Logging:** Structured, `cycle number, pending, done, failed, skipped, row IDs, failure category, next interval, elapsed`, ASCII-safe for `cp1252`, no secrets.
+- **Restart:** `AUDIO_DONE+valid link` → skipped (idempotent, no duplicate Drive upload), `AUDIO_FAILED` → retry after backoff interval per `Updated At`, survives restart via sheet state.
+- **Config:** `WATCH_INTERVAL_SECONDS=30`, `MAX_RETRIES=3`, `RETRY_BASE_DELAY_SECONDS=2`, `RETRY_MAX_DELAY_SECONDS=30` in `config.py` + `.env.example`, validated.
+
 ---
 
 ## 🔊 Telugu TTS Engines (Roadmap — Open-Source-First, Fully Offline Default)
