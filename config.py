@@ -63,10 +63,12 @@ MAX_PODCAST_TURNS = int(os.getenv("MAX_PODCAST_TURNS", "14"))
 TRANSCRIPT_DIR = OUTPUT_DIR / "transcripts"
 TRANSCRIPT_DIR.mkdir(parents=True, exist_ok=True)
 
-TTS_ENGINE = os.getenv("TTS_ENGINE", "edge").lower()
-PIPER_BINARY_PATH = os.getenv("PIPER_BINARY_PATH", "")
-PIPER_MODEL_PATH_TE_FEMALE = os.getenv("PIPER_MODEL_PATH_TE_FEMALE", "")
-PIPER_MODEL_PATH_TE_MALE = os.getenv("PIPER_MODEL_PATH_TE_MALE", "")
+# TTS — Piper CPU/offline primary (Anjali: padmavathi-medium, Ravi: venkatesh-medium)
+# Keep piper CPU/offline as primary; edge-tts/gTTS are fallback only (provider-agnostic)
+TTS_ENGINE = os.getenv("TTS_ENGINE", "piper").lower()  # piper (primary, offline) | edge | gtts | coqui
+PIPER_BINARY_PATH = os.getenv("PIPER_BINARY_PATH", "")  # optional — only if using piper binary; pip piper-tts uses Python API
+PIPER_MODEL_PATH_TE_FEMALE = os.getenv("PIPER_MODEL_PATH_TE_FEMALE", "")  # Anjali → te_IN-padmavathi-medium.onnx (outside Git repo)
+PIPER_MODEL_PATH_TE_MALE = os.getenv("PIPER_MODEL_PATH_TE_MALE", "")  # Ravi → te_IN-venkatesh-medium.onnx (outside Git repo)
 
 # Telugu voices for edge-tts
 VOICE_MAP = {

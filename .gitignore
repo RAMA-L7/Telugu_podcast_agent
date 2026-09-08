@@ -15,5 +15,10 @@ output/transcripts/*.json
 output/transcripts/*.log
 !output/.gitkeep
 !output/transcripts/.gitkeep
+# Piper TTS models — outside Git repo, ~63MB each, do not commit
+*.onnx
+*.onnx.json
+models/
+piper_models/
 .DS_Store
 Thumbs.db

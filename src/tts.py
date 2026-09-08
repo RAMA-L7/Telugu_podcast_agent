@@ -14,14 +14,19 @@ def generate_podcast_mp3(script: List[Dict[str, str]], output_path: Path) -> Pat
     script: [{"speaker": "Anjali"|"Ravi", "text": "..."}, ...]
     output_path: final .mp3 file
     Returns Path to mp3.
+
+    Provider-agnostic: tries TTS_ENGINE first (default piper CPU/offline, Anjali→padmavathi, Ravi→venkatesh),
+    then fallback edge-tts/gTTS/coqui. Piper models are outside Git repo, configurable via .env
+    PIPER_MODEL_PATH_TE_FEMALE/MALE (see .env.example).
     """
     engine = config.TTS_ENGINE.lower()
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Try preferred engine, fallback chain: edge -> gtts -> coqui/piper
+    # Provider-agnostic fallback: preferred engine first, then piper (primary) → edge → gtts → coqui
+    # If TTS_ENGINE=piper (default), tries piper then edge/gtts; if edge, tries edge then piper/gtts
     engines_to_try = [engine]
-    for fallback in ["edge", "gtts"]:
+    for fallback in ["piper", "edge", "gtts", "coqui"]:
         if fallback not in engines_to_try:
             engines_to_try.append(fallback)
 
@@ -159,31 +164,125 @@ def _via_coqui(script, output_path: Path) -> Path:
     combined.export(str(output_path), format="mp3", bitrate="192k")
     return output_path
 
-# ---------- Piper (offline, fast) ----------
+# ---------- Piper (offline, CPU, primary) — Anjali→padmavathi, Ravi→venkatesh ----------
 def _via_piper(script, output_path: Path) -> Path:
-    """Requires piper binary + te_TE models. Set PIPER_* in .env."""
+    """Piper TTS primary — CPU/offline, Anjali=padmavathi-medium (female), Ravi=venkatesh-medium (male).
+
+    Requires: pip install piper-tts + model files outside Git repo (see .env.example).
+    - PIPER_MODEL_PATH_TE_FEMALE: te_IN-padmavathi-medium.onnx (Anjali) — ~63MB, 22050Hz
+    - PIPER_MODEL_PATH_TE_MALE: te_IN-venkatesh-medium.onnx (Ravi) — ~63MB
+    Models downloaded from https://huggingface.co/rhasspy/piper-voices (te/te_IN) — NOT in Git.
+    Falls back to PIPER_BINARY_PATH subprocess if Python API unavailable, else raises to trigger edge/gtts fallback.
+    """
+    from pathlib import Path as _Path
+
+    # Validate model paths — both should be set for 2-speaker podcast; if one missing, fallback to available
+    female_model = (config.PIPER_MODEL_PATH_TE_FEMALE or "").strip()
+    male_model = (config.PIPER_MODEL_PATH_TE_MALE or "").strip()
+    if not female_model and not male_model:
+        raise FileNotFoundError("PIPER_MODEL_PATH_TE_FEMALE/MALE not set — set in .env to models outside Git (see .env.example)")
+
+    # Prefer Python API (pip piper-tts) — no binary needed, works on Windows
+    try:
+        from piper import PiperVoice
+        import soundfile as sf
+        from pydub import AudioSegment
+        import tempfile
+        import numpy as np
+
+        # Load voices — cache per speaker to avoid reload per segment
+        voices = {}
+        def _get_voice(speaker: str):
+            key = speaker if speaker in ("Anjali", "Ravi") else "Anjali"
+            if key in voices:
+                return voices[key]
+            model_path = female_model if key == "Anjali" else male_model
+            if not model_path:
+                # fallback to available
+                model_path = female_model or male_model
+            if not model_path or not _Path(model_path).exists():
+                raise FileNotFoundError(f"Piper model not found for {key}: {model_path}")
+            v = PiperVoice.load(str(model_path))
+            voices[key] = v
+            log.info("Piper voice loaded for %s: %s", key, model_path)
+            return v
+
+        tmpdir = _Path(tempfile.mkdtemp(prefix="telugu_piper_"))
+        segments = []
+        for idx, turn in enumerate(script):
+            text = turn["text"].strip()
+            if not text:
+                continue
+            speaker = turn["speaker"] if turn["speaker"] in ("Anjali", "Ravi") else ("Anjali" if idx % 2 == 0 else "Ravi")
+            voice = _get_voice(speaker)
+            # Synthesize — collect float32 chunks
+            chunks = []
+            sample_rate = 22050
+            for chunk in voice.synthesize(text):
+                chunks.append(chunk.audio_float_array)
+                sample_rate = chunk.sample_rate
+            if not chunks:
+                raise RuntimeError(f"Piper produced no audio for segment {idx} ({speaker})")
+            audio = np.concatenate(chunks)
+            tmp_wav = tmpdir / f"seg_{idx:02d}.wav"
+            sf.write(str(tmp_wav), audio, samplerate=sample_rate)
+            seg = AudioSegment.from_file(str(tmp_wav))
+            segments.append(seg)
+            log.info("piper [%d/%d] %s: %d chars -> %d ms", idx+1, len(script), speaker, len(text), len(seg))
+            try:
+                tmp_wav.unlink()
+            except: pass
+        if not segments:
+            raise ValueError("Piper produced no segments")
+        try:
+            tmpdir.rmdir()
+        except: pass
+
+        silence = AudioSegment.silent(duration=400)
+        combined = segments[0]
+        for seg in segments[1:]:
+            combined += silence + seg
+        combined = AudioSegment.silent(duration=300) + combined + AudioSegment.silent(duration=500)
+        combined.export(str(output_path), format="mp3", bitrate="192k")
+        log.info("Piper MP3 saved: %s (%.1fs, %d turns, Anjali→padmavathi Ravi→venkatesh)", output_path, len(combined)/1000, len(segments))
+        return output_path
+
+    except ImportError as e:
+        log.warning("Piper Python API not available (%s), trying binary fallback", e)
+    except FileNotFoundError:
+        raise
+    except Exception as e:
+        # For other errors, try binary fallback if configured, else re-raise to allow edge/gtts fallback
+        if config.PIPER_BINARY_PATH and _Path(config.PIPER_BINARY_PATH).exists():
+            log.warning("Piper Python API failed (%s), trying binary at %s", e, config.PIPER_BINARY_PATH)
+        else:
+            raise
+
+    # Fallback: subprocess with PIPER_BINARY_PATH (legacy)
     import subprocess
     from pydub import AudioSegment
+    import tempfile
 
-    if not config.PIPER_BINARY_PATH or not Path(config.PIPER_BINARY_PATH).exists():
-        raise FileNotFoundError("PIPER_BINARY_PATH not set or not found")
+    if not config.PIPER_BINARY_PATH or not _Path(config.PIPER_BINARY_PATH).exists():
+        raise FileNotFoundError("PIPER_BINARY_PATH not set and Piper Python API failed — cannot run Piper")
 
-    tmpdir = Path(tempfile.mkdtemp(prefix="telugu_piper_"))
+    tmpdir = _Path(tempfile.mkdtemp(prefix="telugu_piper_"))
     segments = []
     for idx, turn in enumerate(script):
         speaker = turn["speaker"]
-        model = config.PIPER_MODEL_PATH_TE_FEMALE if speaker == "Anjali" else config.PIPER_MODEL_PATH_TE_MALE
+        model = female_model if speaker == "Anjali" else male_model
         if not model:
-            model = config.PIPER_MODEL_PATH_TE_FEMALE or config.PIPER_MODEL_PATH_TE_MALE
+            model = female_model or male_model
+        if not model or not _Path(model).exists():
+            raise FileNotFoundError(f"Piper model not found for {speaker}: {model}")
         tmp_wav = tmpdir / f"seg_{idx:02d}.wav"
-        # Piper reads from stdin, writes wav
         proc = subprocess.run(
             [config.PIPER_BINARY_PATH, "--model", model, "--output_file", str(tmp_wav)],
             input=turn["text"].encode("utf-8"),
             timeout=30,
         )
         if proc.returncode != 0:
-            raise RuntimeError(f"piper failed for segment {idx}")
+            raise RuntimeError(f"piper binary failed for segment {idx}")
         seg = AudioSegment.from_file(str(tmp_wav))
         segments.append(seg)
 
@@ -191,7 +290,14 @@ def _via_piper(script, output_path: Path) -> Path:
     combined = segments[0]
     for seg in segments[1:]:
         combined += silence + seg
+    combined = AudioSegment.silent(duration=300) + combined + AudioSegment.silent(duration=500)
     combined.export(str(output_path), format="mp3", bitrate="192k")
+    # Cleanup
+    for f in tmpdir.glob("*.wav"):
+        try: f.unlink()
+        except: pass
+    try: tmpdir.rmdir()
+    except: pass
     return output_path
 
 # ---------- Helper: list available edge voices ----------
