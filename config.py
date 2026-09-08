@@ -64,6 +64,7 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")  # optional
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")  # optional — only if LLM_PROVIDER=ollama
 
 POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "60"))
+WATCH_INTERVAL_SECONDS = int(os.getenv("WATCH_INTERVAL_SECONDS", "30"))
 MAX_TRANSCRIPT_CHARS = int(os.getenv("MAX_TRANSCRIPT_CHARS", "12000"))
 MAX_PODCAST_TURNS = int(os.getenv("MAX_PODCAST_TURNS", "14"))
 

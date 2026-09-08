@@ -104,7 +104,9 @@ def main():
     parser.add_argument("--run-transcripts", action="store_true", help="Milestone 3: process rows NEW/TEST_OK -> fetch transcript -> TRANSCRIPT_DONE/FAILED (use --dry-run to preview)")
     parser.add_argument("--run-audio", action="store_true", help="Phase 4 Milestone 2: process rows TRANSCRIPT_DONE/AUDIO_FAILED -> Piper TTS -> Drive OAuth upload -> AUDIO_DONE/AUDIO_FAILED (use --dry-run to preview, --limit 1)")
     parser.add_argument("--run-pipeline", action="store_true", help="Phase 5.1: process rows NEW -> TRANSCRIPT_DONE -> AUDIO_DONE (full pipeline: transcript + Piper + Drive, use --dry-run, --limit)")
-    parser.add_argument("--limit", type=int, default=None, help="Limit rows processed (with --run-transcripts/--run-audio/--run-pipeline/--test-sheet)")
+    parser.add_argument("--watch", action="store_true", help="Phase 5.2: watch Google Sheet continuously, poll and run full pipeline (use --interval SECONDS, --dry-run, --limit)")
+    parser.add_argument("--interval", type=int, default=None, help="Override WATCH_INTERVAL_SECONDS for --watch (default 30s, from .env)")
+    parser.add_argument("--limit", type=int, default=None, help="Limit rows processed per cycle (with --run-transcripts/--run-audio/--run-pipeline/--watch/--test-sheet)")
     args = parser.parse_args()
 
     # Sheet connection test mode (focused step, no transcript/audio)
@@ -170,6 +172,21 @@ def main():
             else:
                 print(f"  Row {rid}: {d.get('status')} [{d.get('error_type')}] {str(d.get('error',''))[:100]}")
         return
+
+    # Phase 5.2: continuous watcher (poll and run full pipeline)
+    if args.watch:
+        # Validate incompatible combinations
+        if args.run_transcripts or args.run_audio or args.run_pipeline or args.test_sheet or args.url:
+            parser.error("--watch cannot be combined with --run-transcripts/--run-audio/--run-pipeline/--test-sheet/--url")
+        if args.interval is not None and args.interval <= 0:
+            parser.error("--interval must be > 0")
+        from src.watcher import run_watcher
+        run_watcher(interval=args.interval, dry_run=args.dry_run, limit=args.limit)
+        return
+
+    # Validate --interval requires --watch
+    if args.interval is not None:
+        parser.error("--interval requires --watch")
 
     # Single URL mode
     if args.url:

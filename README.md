@@ -253,12 +253,26 @@ python scripts/run_transcripts.py --limit 1
 python main.py --run-transcripts --dry-run
 python main.py --run-transcripts --limit 1
 
-# Full pipeline (roadmap, after Phase 1)
+# Phase 5.1: full pipeline (NEW -> AUDIO_DONE)
+python main.py --run-pipeline --dry-run --limit 1
+python main.py --run-pipeline --limit 1
+python main.py --run-pipeline --dry-run
+
+# Phase 5.2: continuous watcher (polls Sheet, runs pipeline, idempotent)
+python main.py --watch --dry-run --limit 1          # preview only, no writes
+python main.py --watch --interval 30 --dry-run       # custom interval, dry-run
+python main.py --watch --interval 30                 # live watcher, 30s (WATCH_INTERVAL_SECONDS=30 in .env)
+python main.py --watch --interval 10 --limit 1       # limit per cycle for testing
+# Stop watcher: Ctrl+C (graceful shutdown, exit 0, no partial writes)
+
+# Legacy polling (before watcher)
 python main.py --once
 python main.py
 ```
 
 Outputs: `output/transcripts/<id>.txt|.json`, `output/<id>.mp3|.json`, `output/agent.log` (all gitignored except `.gitkeep`).
+
+Watcher notes: polls via `src/watcher.py` → `src/sheet_monitor.run_pipeline()` (respects `TRANSCRIPT_DONE`/`AUDIO_FAILED` retry, skips `AUDIO_DONE+valid Drive link`, no duplicate uploads), logs startup/interval/cycle/pending/row IDs/done/failed/skipped/next cycle/shutdown (ASCII-safe), transient Sheets/API errors logged and retried next cycle, `WATCH_INTERVAL_SECONDS` in `.env` (default 30) overridden by `--interval`.
 
 ---
 
