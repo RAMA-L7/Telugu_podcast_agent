@@ -43,14 +43,17 @@ GOOGLE_CREDENTIALS_PATH = Path(_raw_creds)
 GOOGLE_CREDENTIALS_FILE = GOOGLE_CREDENTIALS_PATH  # alias
 GOOGLE_TOKEN_PATH = Path(os.getenv("GOOGLE_TOKEN_PATH", "credentials/token.json"))
 
-# LLM — all optional. Basic workflow (including sheet connection test) needs NO LLM.
-# Default is free rule-based Python fallback; Ollama/OpenAI are opt-in for higher quality.
-LLM_PROVIDER = os.getenv("LLM_PROVIDER", "").lower()  # "" = auto / rule-based; set to ollama/openai/gemini/groq to force
-LLM_MODEL = os.getenv("LLM_MODEL", "")
+# LLM — Phase 2 Milestone 3: Gemini 3.5 Flash primary, Ollama optional fallback
+# Default provider: gemini (requires GEMINI_API_KEY), default model: gemini-3.5-flash
+# Rule-based fallback remains and is used when no key / provider disabled / LLMError.
+# Basic workflow and sheet/transcript still work with rule-based and no LLM required.
+# Ollama remains fully supported as optional provider: LLM_PROVIDER=ollama, LLM_MODEL=gemma2:9b
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "gemini").lower()  # default gemini; ""/rule-based/none = force fallback; ollama optional
+LLM_MODEL = os.getenv("LLM_MODEL", "gemini-3.5-flash")  # default gemini-3.5-flash for gemini; overridden by env
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")  # optional — only if LLM_PROVIDER=openai
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")  # optional
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")  # primary — required if LLM_PROVIDER=gemini (never hardcoded)
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")  # optional
-OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")  # optional — only if Ollama installed
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")  # optional — only if LLM_PROVIDER=ollama
 
 POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "60"))
 MAX_TRANSCRIPT_CHARS = int(os.getenv("MAX_TRANSCRIPT_CHARS", "12000"))

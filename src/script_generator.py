@@ -1,176 +1,146 @@
-"""Convert YouTube transcript → conversational Telugu podcast script (2 speakers)."""
+"""Convert YouTube transcript -> conversational Telugu podcast script (2 speakers).
+
+Phase 2 Milestone 3: Gemini 3.5 Flash primary via src/llm.py + Ollama optional + rule-based fallback.
+
+- Uses src.llm.generate() — provider-agnostic, no direct Gemini/Ollama/OpenAI calls here.
+- Respects LLM_PROVIDER / LLM_MODEL via config (default gemini/gemini-3.5-flash, Ollama gemma2:9b optional).
+- GEMINI_API_KEY from env (never hardcoded) when LLM_PROVIDER=gemini; Ollama needs no key.
+- Focused Telugu prompt + system instruction (Anjali/Ravi, factual, natural, concise for TTS).
+- Rule-based fallback preserved exactly; only LLMError triggers fallback (not unrelated programming errors).
+- Public API preserved: generate_telugu_script(transcript, title="") -> List[Dict[speaker,text]]
+"""
 import json
 import logging
 import re
 from typing import List, Dict
 
 import config
+from src.llm import generate as llm_generate, LLMError, get_provider
 
 log = logging.getLogger(__name__)
 
-SYSTEM_PROMPT = """You are a Telugu podcast scriptwriter.
-Convert the given YouTube transcript into a NATURAL, CONVERSATIONAL Telugu podcast dialogue.
+# System instruction for the LLM — act as Telugu podcast writer, follow factual + format rules
+SYSTEM_PROMPT = """You are a Telugu podcast script writer.
+
+Your role: Convert the supplied YouTube transcript into a simple, natural, engaging Telugu conversation between two speakers. Act strictly as a writer — do not add explanations, analysis, or metadata beyond the dialogue.
 
 Speakers:
-- Anjali (female, curious, asks simple questions like a friendly listener)
-- Ravi (male, knowledgeable, explains in SIMPLE Telugu)
+- Anjali (female, curious — asks clear, simple questions as a friendly listener)
+- Ravi (male, knowledgeable — answers in simple, warm Telugu)
 
-Requirements:
-- Language: Simple, everyday Telugu (mostly Telugu script, sprinkle English words where natural like "concept", "example" is okay). Avoid heavy literary/Granthika Telugu.
-- Tone: Friendly, warm, like two friends chatting over chai. Brief summaries, not verbatim lectures.
-- Structure: 8 to {max_turns} turns total, alternating speakers. Start with Anjali greeting + topic intro, end with Ravi closing + key takeaway.
-- Content: Extract 3-5 KEY points from transcript, summarize each in 1-2 turns. Skip filler, ads, repetition.
-- Length: Each turn = 1-3 sentences, ~20-40 words. Total script ~400-700 words.
-- Output: VALID JSON array ONLY, no markdown, no extra text. Format:
+Language:
+- Use simple, everyday spoken Telugu (Unicode Telugu script). Avoid formal / literary / Granthika Telugu.
+- Sprinkle common English words only when natural (e.g., concept, example). Prefer Telugu.
+- Keep sentences short and listener-friendly.
+
+Content:
+- Preserve the transcript's important factual content. Summarize 3–5 key points faithfully.
+- Do NOT invent facts, sources, statistics, quotes, numbers, dates, or events that are not in the transcript.
+- Skip filler, ads, self-promo, repetition, and off-topic chatter.
+- If transcript is English, translate ideas naturally into Telugu — do not transliterate English sentences verbatim.
+
+Structure & Length:
+- Total {max_turns} turns max, alternating speakers. Start with Anjali greeting + topic, end with Ravi short takeaway.
+- Each turn: 1–3 sentences, ~20–40 words. Total ~400–700 words — concise enough for TTS.
+- Maintain Anjali/Ravi alternation; no other speakers.
+
+Output format (strict):
+- Output ONLY a VALID JSON array, no markdown, no fences, no explanations, no metadata.
+- Format exactly:
 [
   {{"speaker": "Anjali", "text": "తెలుగులో ..."}},
   {{"speaker": "Ravi", "text": "తెలుగులో ..."}}
 ]
-
-Rules:
-- Speaker names must be exactly "Anjali" and "Ravi" alternating.
-- Text must be in Telugu (Unicode Telugu script). Use simple language.
-- If transcript is in English, translate ideas to Telugu naturally, don't transliterate English sentences.
-- No stage directions, just dialogue text.
+- Speaker values must be exactly "Anjali" and "Ravi" alternating.
+- Text must be Telugu (Unicode), natural dialogue without stage directions.
 """
 
-USER_TEMPLATE = """Transcript (truncated, may be English):
+USER_TEMPLATE = """Transcript (truncated to {max_chars} chars, may be English/Telugu):
 \"\"\"
 {transcript}
 \"\"\"
 
 Video title hint: {title}
 
-Generate the Telugu podcast script JSON now. Remember: simple Telugu, conversational, brief summaries, 8-{max_turns} turns."""
+Task: Convert the above transcript into the Telugu podcast JSON described. Keep it factual — do not invent beyond the transcript. Keep language simple and conversational, concise for TTS. Output JSON array only (8–{max_turns} turns, Anjali/Ravi)."""
 
 
 def generate_telugu_script(transcript: str, title: str = "") -> List[Dict[str, str]]:
-    """Main entry — free rule-based fallback is the default.
+    """Main entry — tries LLM via src/llm.py (provider-agnostic), falls back to rule-based on LLMError.
 
-    Basic workflow and sheet connection test need NO LLM and NO API key.
-    OPENAI_API_KEY / GEMINI / GROQ / Ollama are all optional and tried only
-    when explicitly configured. Missing keys or missing Ollama never raises.
+    - Respects LLM_PROVIDER / LLM_MODEL (default gemini/gemini-3.5-flash, ollama/gemma2:9b optional).
+    - GEMINI_API_KEY from env when LLM_PROVIDER=gemini (never hardcoded); Ollama needs no key.
+    - If provider disabled (rule-based/none/off/empty forcing fallback), skips LLM.
+    - If provider unavailable, times out, or raises LLMError (Gemini or Ollama), falls back to _rule_based_script.
+    - Does not silently swallow unrelated programming errors (e.g., bugs in _parse_json_script beyond ValueError are re-raised).
+    - Keeps _rule_based_script unchanged for compatibility; public API preserved.
     """
     max_turns = config.MAX_PODCAST_TURNS
-    transcript = transcript[: config.MAX_TRANSCRIPT_CHARS]
+    transcript = (transcript or "").strip()
+    if not transcript:
+        log.warning("Empty transcript — using rule-based fallback")
+        return _rule_based_script("", title, max_turns)
 
-    # Build provider list only from explicit config / available keys.
-    # If nothing configured, we go straight to rule-based (no network).
-    providers: List[str] = []
-    prov = (config.LLM_PROVIDER or "").lower().strip()
+    # Truncate for LLM context (keep rule-based on truncated as well for consistency)
+    truncated = transcript[: config.MAX_TRANSCRIPT_CHARS]
 
-    if prov == "openai" and config.OPENAI_API_KEY:
-        providers = ["openai"]
-    elif prov == "gemini" and config.GEMINI_API_KEY:
-        providers = ["gemini"]
-    elif prov == "groq" and config.GROQ_API_KEY:
-        providers = ["groq"]
-    elif prov == "ollama":
-        # Ollama is optional — only try if user explicitly asked for it
-        providers = ["ollama"]
-    elif prov in ("", "rule-based", "rules", "none", "off"):
-        providers = []  # stay on rule-based
-    else:
-        # Auto-detect only if user set a key but left LLM_PROVIDER empty
-        if config.OPENAI_API_KEY:
-            providers.append("openai")
-        if config.GEMINI_API_KEY:
-            providers.append("gemini")
-        if config.GROQ_API_KEY:
-            providers.append("groq")
-        # Do NOT auto-add ollama — it requires a local server and should be opt-in.
-        # If user wants Ollama, set LLM_PROVIDER=ollama explicitly.
+    prov = (get_provider() or "").strip().lower()
+    # Explicit rule-based/disabled check — no LLM call, direct fallback (no LLMError)
+    if not prov:
+        log.info("LLM disabled (provider=%r) — using rule-based script generation", get_provider())
+        return _rule_based_script(truncated, title, max_turns)
 
-    if not providers:
-        log.info("No LLM configured (OPENAI_API_KEY/Ollama not set) — using free rule-based script generation")
-        return _rule_based_script(transcript, title, max_turns)
-
-    last_err = None
-    for provider in providers:
-        try:
-            if provider == "openai":
-                return _via_openai(transcript, title, max_turns)
-            elif provider == "gemini":
-                return _via_gemini(transcript, title, max_turns)
-            elif provider == "groq":
-                return _via_groq(transcript, title, max_turns)
-            elif provider == "ollama":
-                return _via_ollama(transcript, title, max_turns)
-        except Exception as e:
-            log.warning("LLM %s failed: %s", provider, e)
-            last_err = e
-            continue
-
-    log.warning("All configured LLM providers failed (%s), using rule-based fallback", last_err)
-    return _rule_based_script(transcript, title, max_turns)
-
-
-def _via_openai(transcript, title, max_turns):
-    from openai import OpenAI
-    client = OpenAI(api_key=config.OPENAI_API_KEY)
-    resp = client.chat.completions.create(
-        model=config.LLM_MODEL,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT.format(max_turns=max_turns)},
-            {"role": "user", "content": USER_TEMPLATE.format(transcript=transcript, title=title, max_turns=max_turns)},
-        ],
-        temperature=0.7,
-        max_tokens=2000,
+    # Build prompt + system for LLM adapter (no direct Ollama calls here)
+    system = SYSTEM_PROMPT.format(max_turns=max_turns)
+    user_prompt = USER_TEMPLATE.format(
+        transcript=truncated,
+        title=title or "Untitled",
+        max_turns=max_turns,
+        max_chars=config.MAX_TRANSCRIPT_CHARS,
     )
-    text = resp.choices[0].message.content.strip()
-    return _parse_json_script(text)
 
-def _via_gemini(transcript, title, max_turns):
-    import google.generativeai as genai
-    genai.configure(api_key=config.GEMINI_API_KEY)
-    model = genai.GenerativeModel(
-        config.LLM_MODEL or "gemini-1.5-flash",
-        system_instruction=SYSTEM_PROMPT.format(max_turns=max_turns),
-    )
-    resp = model.generate_content(USER_TEMPLATE.format(transcript=transcript, title=title, max_turns=max_turns))
-    return _parse_json_script(resp.text)
+    # Call provider-agnostic LLM adapter with clear timeout (Gemini/Ollama-aware via src.llm)
+    try:
+        # Use 90s for gemini-3.5-flash / gemma2:9b (generous for network + large model)
+        raw_text = llm_generate(prompt=user_prompt, system=system, timeout=90)
+    except LLMError as e:
+        # Expected LLM failure — fallback to rule-based (do not swallow programming errors)
+        log.warning("LLM %s failed (%s) — falling back to rule-based script: %s", prov, type(e).__name__, e)
+        return _rule_based_script(truncated, title, max_turns)
+    except Exception as e:
+        # Unrelated programming error — do not silently swallow, log and re-raise
+        # But to keep pipeline resilient, we still fallback for any Exception that is clearly LLM-related?
+        # Spec: do not silently swallow unrelated programming errors — so re-raise if not LLMError
+        # However, to avoid crashing pipeline on transient LLM output issues, treat JSON errors as fallback below.
+        # Here we only catch LLMError above, so other exceptions bubble up.
+        log.exception("Unexpected error calling LLM (not LLMError) — re-raising: %s", e)
+        raise
 
-def _via_groq(transcript, title, max_turns):
-    from groq import Groq
-    client = Groq(api_key=config.GROQ_API_KEY)
-    resp = client.chat.completions.create(
-        model=config.LLM_MODEL or "llama-3.1-70b-versatile",
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT.format(max_turns=max_turns)},
-            {"role": "user", "content": USER_TEMPLATE.format(transcript=transcript, title=title, max_turns=max_turns)},
-        ],
-        temperature=0.7,
-        max_tokens=2000,
-    )
-    return _parse_json_script(resp.choices[0].message.content.strip())
+    # Normalize LLM output: strip markdown fences if present, then parse JSON array
+    # (LLM may still emit ```json fences despite instruction — handle gracefully)
+    try:
+        return _parse_json_script(raw_text)
+    except (ValueError, json.JSONDecodeError) as e:
+        # LLM returned malformed JSON — fallback to rule-based (common with small models)
+        log.warning("LLM output JSON parse failed (%s) — falling back to rule-based: %s — raw: %r", type(e).__name__, e, raw_text[:300])
+        return _rule_based_script(truncated, title, max_turns)
 
-def _via_ollama(transcript, title, max_turns):
-    import requests
-    prompt = SYSTEM_PROMPT.format(max_turns=max_turns) + "\n\n" + USER_TEMPLATE.format(transcript=transcript, title=title, max_turns=max_turns)
-    resp = requests.post(
-        f"{config.OLLAMA_BASE_URL}/api/generate",
-        json={"model": config.LLM_MODEL or "llama3.1:8b", "prompt": prompt, "stream": False},
-        timeout=120,
-    )
-    resp.raise_for_status()
-    return _parse_json_script(resp.json()["response"])
 
 def _parse_json_script(text: str) -> List[Dict[str, str]]:
-    # Strip markdown fences
+    # Strip markdown fences (``` or ```json) and surrounding whitespace
     text = re.sub(r"^```(?:json)?\s*", "", text.strip())
     text = re.sub(r"\s*```$", "", text.strip())
-    # Extract JSON array
+    # Extract JSON array if LLM added surrounding prose (despite instruction)
     m = re.search(r"\[.*\]", text, flags=re.DOTALL)
     if m:
         text = m.group(0)
     data = json.loads(text)
-    # Validate
+    # Validate and normalize Anjali/Ravi alternation
     cleaned = []
     for item in data:
         speaker = item.get("speaker", "").strip().capitalize()
         t = item.get("text", "").strip()
         if speaker not in ("Anjali", "Ravi"):
-            # Fix alternating if LLM used Telugu names
             speaker = "Anjali" if len(cleaned) % 2 == 0 else "Ravi"
         if t:
             cleaned.append({"speaker": speaker, "text": t})
