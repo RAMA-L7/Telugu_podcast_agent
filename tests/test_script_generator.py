@@ -197,6 +197,100 @@ def test_no_openai_key_required_when_using_ollama():
         config.LLM_PROVIDER = orig_provider
         config.OPENAI_API_KEY = orig_openai
 
+def test_short_transcript_proportional_small():
+    """Short transcript (~50 words) should target small podcast (not long)."""
+    short = "This is a short transcript. " * 12  # ~60 words
+    params = sg._compute_target_params(short)
+    assert params["target_turns"] <= 14, f"short should be <=14 turns, got {params['target_turns']}"
+    assert params["min_words"] <= 650 and params["max_words"] <= 700
+    # Rule-based fallback should also be small
+    rb = sg._rule_based_script(short, "Short Test", max_turns=params["target_turns"])
+    assert len(rb) == params["target_turns"] or len(rb) <= params["target_turns"]
+    assert len(rb) <= 14
+    print(f"PASS: test_short_transcript_proportional_small (turns={params['target_turns']} rb={len(rb)})")
+
+def test_medium_transcript_proportional_medium():
+    """Medium transcript (~600 words) should target medium podcast."""
+    # 600 words: 10-word sentence *60
+    sentence = "Medium content sentence with enough length to be valid for testing. "  # 10 words
+    medium = sentence * 60  # exactly 600 words
+    params = sg._compute_target_params(medium)
+    assert 16 <= params["target_turns"] <= 26, f"medium turns {params['target_turns']} not in 16-26"
+    assert 600 <= params["min_words"] <= 900
+    # Prompt should reflect proportional sizing when LLM called
+    captured = {}
+    def fake_gen(prompt, system, timeout=90):
+        captured["system"] = system
+        captured["prompt"] = prompt
+        return MOCK_LLM_JSON
+    with patch("src.script_generator.llm_generate", side_effect=fake_gen):
+        orig = config.LLM_PROVIDER
+        try:
+            config.LLM_PROVIDER = "ollama"
+            sg.generate_telugu_script(medium, title="Medium")
+            # System should mention proportional target turns, not fixed 14
+            assert str(params["target_turns"]) in captured["system"] or f"{params['target_turns']} turns" in captured["system"]
+            print(f"PASS: test_medium_transcript_proportional_medium (turns={params['target_turns']})")
+        finally:
+            config.LLM_PROVIDER = orig
+
+def test_long_transcript_proportional_large():
+    """Long transcript (~1095 words / 5825 chars like 5vwbbLB3Uww) should target ~32 turns, 7-9 min."""
+    # Build exactly ~1095 words: 10-word sentence *109 =1090 + extra 5 =1095
+    sentence = "Long transcript content with substantial factual prison reform history details. "  # 10 words
+    long_txt = sentence * 109 + "Extra words to reach target length."  # 1090 +6 =1096
+    # Ensure chars roughly 5800-6500
+    assert 1000 <= len(long_txt.split()) <= 1150, f"words {len(long_txt.split())}"
+    params = sg._compute_target_params(long_txt)
+    assert 28 <= params["target_turns"] <= 40, f"long turns {params['target_turns']} not in 28-40"
+    assert params["min_words"] >= 700 and params["max_words"] <= 1300
+    # Verify rule-based scales: long should produce substantially more turns than short
+    short = "Short valid sentence. " * 30  # ~90 words -> short bucket
+    short_params = sg._compute_target_params(short)
+    rb_short = sg._rule_based_script(short, "Short", max_turns=short_params["target_turns"])
+    rb_long = sg._rule_based_script(long_txt, "Long", max_turns=params["target_turns"])
+    assert len(rb_long) > len(rb_short) + 8, f"long rb {len(rb_long)} should be > short rb {len(rb_short)}+8"
+    # Verify LLM prompt for long mentions larger target and proportional words
+    captured = {}
+    def fake_gen(prompt, system, timeout=90):
+        captured["system"] = system
+        return MOCK_LLM_JSON
+    with patch("src.script_generator.llm_generate", side_effect=fake_gen):
+        orig = config.LLM_PROVIDER
+        try:
+            config.LLM_PROVIDER = "ollama"
+            sg.generate_telugu_script(long_txt, title="Long Video")
+            assert str(params["target_turns"]) in captured["system"]
+            # Should contain proportional language, not fixed 400-700
+            assert f"{params['min_words']}" in captured["system"] or f"{params['max_words']}" in captured["system"]
+            assert "Do NOT limit a 12-minute source" in captured["system"] or "proportional" in captured["system"].lower()
+            print(f"PASS: test_long_transcript_proportional_large (turns={params['target_turns']} words {params['min_words']}-{params['max_words']})")
+        finally:
+            config.LLM_PROVIDER = orig
+
+def test_long_transcript_avoids_fixed_14_turn_limit():
+    """Ensure long transcript does not get capped at 14 turns (previous bug)."""
+    long_txt = ("Sentence about important fact number. " * 6) * 180  # ~1080 words
+    params = sg._compute_target_params(long_txt)
+    assert params["target_turns"] > 14, f"long should exceed fixed 14, got {params['target_turns']}"
+    # Also ensure system prompt for long does not say 400-700 fixed
+    captured = {}
+    def fake_gen(prompt, system, timeout=90):
+        captured["system"] = system
+        return MOCK_LLM_JSON
+    with patch("src.script_generator.llm_generate", side_effect=fake_gen):
+        orig = config.LLM_PROVIDER
+        try:
+            config.LLM_PROVIDER = "gemini"
+            sg.generate_telugu_script(long_txt, title="Long")
+            # Old fixed string "400–700 words" should not appear verbatim for long
+            # New prompt should contain larger range like 750/950/1050/1300 and >14 turns
+            assert ("750" in captured["system"] or "950" in captured["system"] or "1050" in captured["system"] or "1300" in captured["system"] or "38 turns" in captured["system"])
+            assert "38 turns" in captured["system"] or str(params["target_turns"]) in captured["system"]
+            print("PASS: test_long_transcript_avoids_fixed_14_turn_limit")
+        finally:
+            config.LLM_PROVIDER = orig
+
 if __name__ == "__main__":
     test_successful_llm_generated_telugu_script()
     test_correct_use_of_transcript_content_in_prompt()
@@ -206,4 +300,8 @@ if __name__ == "__main__":
     test_disabled_provider_still_works()
     test_markdown_fences_normalized()
     test_no_openai_key_required_when_using_ollama()
+    test_short_transcript_proportional_small()
+    test_medium_transcript_proportional_medium()
+    test_long_transcript_proportional_large()
+    test_long_transcript_avoids_fixed_14_turn_limit()
     print("\nAll script_generator tests PASSED (mocked, no Ollama/network required).")

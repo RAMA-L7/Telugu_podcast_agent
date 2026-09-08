@@ -19,6 +19,71 @@ from src.llm import generate as llm_generate, LLMError, get_provider
 
 log = logging.getLogger(__name__)
 
+def _compute_target_params(transcript: str) -> Dict[str, int]:
+    """Compute target podcast size proportional to source transcript length.
+
+    Scaling keeps short videos short while preserving substantially more
+    coverage for long videos. Targets ~0.6x source duration for Telugu audio.
+    For ~12-13 min source (~1000-1100 words, ~5800 chars) targets ~7-9 min
+    Telugu audio (~1050-1350 words, ~32-38 turns) instead of fixed 14-turn
+    ~2 min compression.
+
+    Returns dict with target_turns, min_words, max_words, source_words, source_chars.
+    """
+    txt = (transcript or "").strip()
+    source_words = len(txt.split()) if txt else 0
+    source_chars = len(txt)
+    # Fallback if word split undercounts (e.g., no spaces): estimate from chars
+    if source_words < 10 and source_chars > 50:
+        est = source_chars // 5
+        if est > source_words:
+            source_words = est
+
+    # Proportional target: scales with source so podcast length ~0.7-0.85x source
+    # Piper Telugu ~105 wpm actual (measured: 683 words -> 388s). Use 105 wpm for estimates.
+    # Short stays short, long grows substantially: 1095 words (~8.4 min) -> ~800-1050 words (~7.6-10 min)
+    if source_words < 300:
+        # Short ~1-2 min source -> ~3-4 min podcast
+        target_turns, min_w, max_w = 12, 350, 600
+    elif source_words < 600:
+        # Medium-short ~3-4.5 min source -> ~5-7 min podcast
+        target_turns, min_w, max_w = 18, 550, 850
+    elif source_words < 1000:
+        # Medium ~5-7.5 min source -> ~6-8.5 min podcast
+        target_turns, min_w, max_w = 24, 700, 1000
+    elif source_words < 1500:
+        # ~12-13 min source (1095 words, 5825 chars) -> ~7-9 min Telugu (750-1050 words at 105 wpm = 7.1-10 min)
+        # Lowered from 1100-1450 to be achievable for LLM and match actual Piper rate
+        target_turns, min_w, max_w = 32, 750, 1050
+    else:
+        # Very long >11 min source
+        target_turns, min_w, max_w = 38, 950, 1300
+
+    # Also respect config override as absolute max for safety, but allow larger than
+    # config.MAX_PODCAST_TURNS for long sources (avoid fixed 14 cap)
+    # If transcript is short, keep cap at config value; if long, use computed larger value
+    if source_words >= 800:
+        # For long sources, ignore small config cap and use computed scaling
+        pass
+    else:
+        # For short, ensure we don't exceed config cap too much
+        cfg_max = getattr(config, "MAX_PODCAST_TURNS", 14)
+        try:
+            cfg_max = int(cfg_max)
+        except Exception:
+            cfg_max = 14
+        if target_turns > cfg_max + 6 and source_words < 600:
+            target_turns = cfg_max + 4
+
+    return {
+        "target_turns": target_turns,
+        "min_words": min_w,
+        "max_words": max_w,
+        "source_words": source_words,
+        "source_chars": source_chars,
+    }
+
+
 # System instruction for the LLM — act as Telugu podcast writer, follow factual + format rules
 SYSTEM_PROMPT = """You are a Telugu podcast script writer.
 
@@ -34,15 +99,18 @@ Language:
 - Keep sentences short and listener-friendly.
 
 Content:
-- Preserve the transcript's important factual content. Summarize 3–5 key points faithfully.
-- Do NOT invent facts, sources, statistics, quotes, numbers, dates, or events that are not in the transcript.
-- Skip filler, ads, self-promo, repetition, and off-topic chatter.
+- Preserve substantially more of the transcript's important factual content — do NOT compress a long video into a brief summary. Cover key facts, arguments, examples, and narrative arc proportionally.
+- Do NOT invent facts, sources, statistics, quotes, numbers, dates, or events that are not in the transcript. Do not add facts from your own knowledge.
+- Do NOT simply translate the transcript word-for-word — synthesize into natural conversational Telugu.
+- Skip filler, ads, self-promo, repetition, and off-topic chatter, but keep important substance.
 - If transcript is English, translate ideas naturally into Telugu — do not transliterate English sentences verbatim.
 
-Structure & Length:
-- Total {max_turns} turns max, alternating speakers. Start with Anjali greeting + topic, end with Ravi short takeaway.
-- Each turn: 1–3 sentences, ~20–40 words. Total ~400–700 words — concise enough for TTS.
-- Maintain Anjali/Ravi alternation; no other speakers.
+Structure & Length (proportional to source — CRITICAL):
+- Source length: ~{source_words} words (~{source_chars} chars, ~{source_minutes:.1f} min spoken). Target Telugu podcast: ~{target_turns} turns (±2, NOT ±6), alternating speakers, start with Anjali greeting + topic, end with Ravi short takeaway.
+- Each turn: MUST be 2–3 sentences, ~28–35 words per turn (average at least 25 words). Do NOT write 1-sentence 10-15 word turns. Longer turns are required to reach total word target.
+- Total target: ~{min_words}–{max_words} words (aim ~{avg_words} words) — this scales with source length. For this source, that corresponds to roughly {target_minutes:.1f} minutes of Telugu audio at ~105 wpm (proportional, not fixed at 8–14 turns). Do NOT limit a 12-minute source to only 14 short turns and do NOT produce a brief 400-500 word summary for this long source.
+- You MUST count words before outputting: total words MUST be at least {min_words} and at least {target_turns} turns. If you produce fewer words or turns, you have FAILED — expand with more factual coverage, more examples, more narrative arcs from source.
+- Maintain Anjali/Ravi alternation; no other speakers. Keep it natural, engaging spoken Telugu, not repetitive filler, but do NOT sacrifice coverage for brevity.
 
 Output format (strict):
 - Output ONLY a VALID JSON array, no markdown, no fences, no explanations, no metadata.
@@ -55,14 +123,14 @@ Output format (strict):
 - Text must be Telugu (Unicode), natural dialogue without stage directions.
 """
 
-USER_TEMPLATE = """Transcript (truncated to {max_chars} chars, may be English/Telugu):
+USER_TEMPLATE = """Transcript (truncated to {max_chars} chars, may be English/Telugu, {source_words} words, ~{source_minutes:.1f} min):
 \"\"\"
 {transcript}
 \"\"\"
 
 Video title hint: {title}
 
-Task: Convert the above transcript into the Telugu podcast JSON described. Keep it factual — do not invent beyond the transcript. Keep language simple and conversational, concise for TTS. Output JSON array only (8–{max_turns} turns, Anjali/Ravi)."""
+Task: Convert the above transcript into the Telugu podcast JSON described. Keep it factual — do not invent beyond the transcript. Keep language simple and conversational. Source is ~{source_words} words (~{source_minutes:.1f} min) — you MUST produce ~{target_turns} turns (±2) and ~{min_words}–{max_words} words total (aim ~{avg_words} words, ~{target_minutes:.1f} min Telugu audio). Count words: each turn ~28-35 words, total must be >= {min_words}. Proportional coverage is REQUIRED, not a brief 400-word summary. Output JSON array only (Anjali/Ravi alternating, start Anjali, end Ravi)."""
 
 
 def generate_telugu_script(transcript: str, title: str = "") -> List[Dict[str, str]]:
@@ -73,30 +141,56 @@ def generate_telugu_script(transcript: str, title: str = "") -> List[Dict[str, s
     - If provider disabled (rule-based/none/off/empty forcing fallback), skips LLM.
     - If provider unavailable, times out, or raises LLMError (Gemini or Ollama), falls back to _rule_based_script.
     - Does not silently swallow unrelated programming errors (e.g., bugs in _parse_json_script beyond ValueError are re-raised).
-    - Keeps _rule_based_script unchanged for compatibility; public API preserved.
+    - Keeps _rule_based_script for compatibility; public API preserved (proportional sizing).
     """
-    max_turns = config.MAX_PODCAST_TURNS
     transcript = (transcript or "").strip()
-    if not transcript:
-        log.warning("Empty transcript — using rule-based fallback")
-        return _rule_based_script("", title, max_turns)
+    # Truncate for LLM context (keep rule-based on truncated as well)
+    truncated = transcript[: config.MAX_TRANSCRIPT_CHARS] if transcript else ""
+    # Proportional target based on truncated length (so LLM sees same basis)
+    target = _compute_target_params(truncated if truncated else transcript)
+    target_turns = target["target_turns"]
+    min_w, max_w = target["min_words"], target["max_words"]
+    source_words, source_chars = target["source_words"], target["source_chars"]
+    avg_words = (min_w + max_w) // 2
+    # Rough minute estimates for prompt guidance (not binding) — Piper Telugu ~105 wpm measured (683 words -> 388s)
+    source_minutes = source_words / 130.0 if source_words else 0  # ~130 wpm English source estimate
+    target_minutes = avg_words / 105.0 if avg_words else 0  # Telugu Piper ~105 wpm actual
+    # Keep config.MAX_PODCAST_TURNS as fallback for very short but still respect computed scaling
+    # For backwards compat, max_turns variable now is target_turns
+    max_turns = target_turns
 
-    # Truncate for LLM context (keep rule-based on truncated as well for consistency)
-    truncated = transcript[: config.MAX_TRANSCRIPT_CHARS]
+    if not transcript:
+        log.warning("Empty transcript — using rule-based fallback (target %s turns)", target_turns)
+        return _rule_based_script("", title, target_turns)
 
     prov = (get_provider() or "").strip().lower()
     # Explicit rule-based/disabled check — no LLM call, direct fallback (no LLMError)
     if not prov:
-        log.info("LLM disabled (provider=%r) — using rule-based script generation", get_provider())
-        return _rule_based_script(truncated, title, max_turns)
+        log.info("LLM disabled (provider=%r) — using rule-based script generation (target %s turns, %s words)", get_provider(), target_turns, avg_words)
+        return _rule_based_script(truncated, title, target_turns)
 
-    # Build prompt + system for LLM adapter (no direct Ollama calls here)
-    system = SYSTEM_PROMPT.format(max_turns=max_turns)
+    # Build proportional prompt + system for LLM adapter (no direct Ollama calls here)
+    system = SYSTEM_PROMPT.format(
+        source_words=source_words,
+        source_chars=source_chars,
+        source_minutes=source_minutes,
+        target_turns=target_turns,
+        min_words=min_w,
+        max_words=max_w,
+        avg_words=avg_words,
+        target_minutes=target_minutes,
+    )
     user_prompt = USER_TEMPLATE.format(
         transcript=truncated,
         title=title or "Untitled",
-        max_turns=max_turns,
         max_chars=config.MAX_TRANSCRIPT_CHARS,
+        source_words=source_words,
+        source_minutes=source_minutes,
+        target_turns=target_turns,
+        min_words=min_w,
+        max_words=max_w,
+        avg_words=avg_words,
+        target_minutes=target_minutes,
     )
 
     # Call provider-agnostic LLM adapter with clear timeout (Gemini/Ollama-aware via src.llm)
@@ -149,16 +243,29 @@ def _parse_json_script(text: str) -> List[Dict[str, str]]:
     return cleaned
 
 def _rule_based_script(transcript: str, title: str, max_turns: int) -> List[Dict[str, str]]:
-    """Extractive fallback - no API key needed. Generates simple Telugu template."""
+    """Extractive fallback - no API key needed. Generates simple Telugu template.
+
+    Scales with max_turns (proportional target) so long transcripts get more
+    coverage instead of fixed 5-sentence summary.
+    """
     # Naive sentence split
     sentences = re.split(r"(?<=[.!?।])\s+", transcript.strip())
     sentences = [s.strip() for s in sentences if len(s.strip()) > 20]
-    # Pick up to 5 key sentences evenly spaced
-    if len(sentences) > 5:
-        step = len(sentences) / 5
-        picked = [sentences[int(i * step)] for i in range(5)]
+    # Number of key sentences proportional to target_turns:
+    # turns ≈ 1 greeting + picked*2 + 2 closing => picked ≈ (max_turns -3)//2
+    # For short (12 turns) => ~4 picks, for long (32 turns) => ~14 picks
+    desired_picks = max(5, (max_turns - 3) // 2)
+    # Clamp to available sentences, but at least 3
+    desired_picks = min(len(sentences) if sentences else 0, desired_picks) if sentences else 0
+    if desired_picks == 0:
+        # Fallback if no sentences: use transcript chunk
+        picked = [transcript[:200]] if transcript else [title or "ఈ వీడియో"]
     else:
-        picked = sentences[:5]
+        if len(sentences) > desired_picks:
+            step = len(sentences) / desired_picks
+            picked = [sentences[int(i * step)] for i in range(desired_picks)]
+        else:
+            picked = sentences[:desired_picks]
     if not picked:
         picked = [transcript[:200]]
 

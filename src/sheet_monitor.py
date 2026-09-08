@@ -106,6 +106,170 @@ def _col_index(name: str) -> int:
     except ValueError:
         raise ValueError(f"Column '{name}' not in SHEET_HEADER {config.SHEET_HEADER}")
 
+# ---------------------------------------------------------------------------
+# Podcast Job ID — centralized allocation (sequential, 4-digit, never reuse)
+# ---------------------------------------------------------------------------
+def _is_valid_podcast_id(id_str: str) -> bool:
+    """Check if ID is valid numeric podcast job ID (non-empty, digits only)."""
+    s = str(id_str).strip() if id_str is not None else ""
+    if not s:
+        return False
+    # Must be digits only (allow leading zeros, e.g., 0001)
+    if not s.isdigit():
+        return False
+    try:
+        num = int(s)
+        return num > 0  # 0 is not a valid job ID; IDs start at 1
+    except Exception:
+        return False
+
+def _parse_podcast_id_numeric(id_str: str) -> Optional[int]:
+    """Parse podcast ID to int if valid, else None."""
+    if _is_valid_podcast_id(id_str):
+        try:
+            return int(str(id_str).strip())
+        except Exception:
+            return None
+    return None
+
+def allocate_next_podcast_id(ws=None) -> str:
+    """Allocate next sequential Podcast Job ID (4-digit, zero-padded).
+
+    Scans existing sheet IDs, finds MAX numeric ID, returns MAX+1 formatted as 4 digits.
+    Ignores blank and non-numeric cells. Never reuses deleted IDs (MAX+1).
+    Centralized — caller should persist to sheet immediately to avoid duplicate allocation.
+    Single-process safe (reads fresh sheet each call).
+
+    Returns:
+        str: e.g., "0001", "0012", "5001"
+    """
+    ws = ws or get_sheet()
+    records = ws.get_all_records()
+    max_id = 0
+    for r in records:
+        id_str = str(r.get("ID", "")).strip()
+        num = _parse_podcast_id_numeric(id_str)
+        if num is not None and num > max_id:
+            max_id = num
+    next_id = max_id + 1
+    # If no valid IDs exist, start at 1
+    if next_id < 1:
+        next_id = 1
+    return f"{next_id:04d}"
+
+def _clean_title_for_filename(title: str, max_len: int = 60) -> str:
+    """Clean title into filesystem-safe readable slug.
+
+    - Removes unsafe Windows filename characters: < > : \" / \\ | ? * and control chars 0x00-0x1F
+    - Removes other punctuation except word chars, spaces, hyphens, underscores
+    - Normalizes excessive whitespace/underscores to single underscore
+    - Truncates to max_len, stripping trailing underscores/hyphens
+    - Falls back to 'untitled' if empty
+    """
+    import re
+    if not title or not str(title).strip():
+        return "untitled"
+    t = str(title).strip()
+    # Remove Windows forbidden and control chars
+    t = re.sub(r'[<>:"/\\|?*\x00-\x1F]', "", t)
+    # Keep word chars (including Unicode), spaces, hyphens, underscores; remove other punctuation
+    t = re.sub(r"[^\w\s-]", "", t, flags=re.UNICODE)
+    # Normalize whitespace to single underscore
+    t = re.sub(r"\s+", "_", t.strip())
+    # Collapse multiple underscores/hyphens
+    t = re.sub(r"_+", "_", t)
+    t = re.sub(r"-+", "-", t)
+    t = t.strip("_-")
+    # Truncate to max_len at word boundary (last complete word)
+    if len(t) > max_len:
+        truncated = t[:max_len]
+        if len(t) > max_len and t[max_len] not in ("_", "-") and truncated[-1] not in ("_", "-"):
+            last_us = truncated.rfind("_")
+            last_hy = truncated.rfind("-")
+            last_sep = max(last_us, last_hy)
+            if last_sep > 0:
+                truncated = truncated[:last_sep]
+        t = truncated.rstrip("_-")
+        t = re.sub(r"_+$", "", t)
+        t = t.strip("_-")
+    if not t:
+        return "untitled"
+    return t
+
+def _format_duration_mm_ss(seconds: float) -> str:
+    """Format duration seconds as MMmSSs, zero-padded: e.g., 495 -> 08m15s."""
+    try:
+        total = int(round(float(seconds)))
+    except Exception:
+        total = 0
+    if total < 0:
+        total = 0
+    minutes = total // 60
+    secs = total % 60
+    return f"{minutes:02d}m{secs:02d}s"
+
+def _ensure_podcast_id(ws, row: Dict, dry_run: bool = False) -> str:
+    """Ensure row has valid Podcast Job ID; allocate next sequential if empty.
+
+    - Uses existing ID if valid (digits, >0)
+    - Else allocates MAX+1 as 4-digit, persists to sheet (unless dry_run)
+    - Never reuses deleted IDs, never uses row numbers
+    - Safe for single-process watcher (reads fresh sheet each allocation)
+
+    Returns:
+        str: podcast_id (existing or newly allocated)
+    """
+    record = row.get("record", {}) if isinstance(row.get("record"), dict) else {}
+    # Try multiple possible keys for ID (row dict vs record)
+    current_id = str(record.get("ID", "")).strip() if record else ""
+    if not current_id:
+        current_id = str(row.get("id", "")).strip()
+    if _is_valid_podcast_id(current_id):
+        # Preserve existing, ensure 4-digit formatting (but do not unnecessarily change)
+        # If existing is "2" we keep "2" as is for traceability, but return padded for filename?
+        # Requirement: IDs must be sequential numeric values formatted as 4 digits.
+        # For existing valid IDs that are not padded (e.g., "2"), we preserve as is in sheet,
+        # but for filename we will use padded version. For consistency, return padded.
+        try:
+            num = int(current_id)
+            pid_padded = f"{num:04d}"
+            # Only update sheet if existing is not already padded and we want to normalize?
+            # Requirement: Existing valid IDs must not be unnecessarily changed, so keep as is.
+            # Return padded for filename generation but don't overwrite sheet.
+            return pid_padded if len(current_id) != 4 else current_id
+        except:
+            return current_id
+    # Empty or invalid -> allocate next
+    next_id = allocate_next_podcast_id(ws)
+    if dry_run:
+        log.info("[DRY-RUN] Would allocate Podcast ID %s for Row %s (YouTube %r)", next_id, row.get("row_num", "?"), row.get("youtube_link", row.get("url", ""))[:40])
+        # Do not write, but return next_id for dry-run simulation
+        # Also update in-memory record for downstream steps in dry-run
+        if record is not None:
+            record["ID"] = next_id
+        row["id"] = next_id
+        return next_id
+    # Persist to sheet
+    row_num = row.get("row_num")
+    if row_num:
+        try:
+            ws.update_cell(row_num, _col_index("ID"), next_id)
+            log.info("Allocated Podcast ID %s for Row %d (YouTube %r)", next_id, row_num, row.get("youtube_link", row.get("url", ""))[:40])
+            # Update in-memory
+            if record is not None:
+                record["ID"] = next_id
+            row["id"] = next_id
+            row["record"] = record
+        except Exception as e:
+            log.warning("Failed to persist Podcast ID %s for Row %d: %s", next_id, row_num, e)
+            # Still return next_id; caller will have it for filename but sheet may be inconsistent
+            # Next allocation will see this ID only if persisted, so duplicate risk if persist fails
+            # We still update in-memory to avoid immediate duplicate
+            if record is not None:
+                record["ID"] = next_id
+            row["id"] = next_id
+    return next_id
+
 def fetch_pending_rows(ws=None) -> List[Dict]:
     """Return rows where Status == NEW (strict, case-insensitive, trimmed).
     
@@ -171,11 +335,12 @@ def process_transcript_row(ws, row: Dict, dry_run: bool = False) -> Dict:
     """Process one row: validate YouTube Link, fetch transcript, save locally.
 
     Sheet-safe:
-      - On valid: saves to output/transcripts/<video_id>.{txt,json}, then
+      - On valid: saves to output/transcripts/<ID>_<clean_title>.{txt,json} (ID-based), then
         updates sheet Transcript Link + Title + Status=TRANSCRIPT_DONE + clear Error + Updated At
       - On invalid/empty/fetch failure: does NOT write Transcript Link; sets
         Status=TRANSCRIPT_FAILED + Error (truncated) + Updated At
       - On dry_run: does everything except ws.update_cell (logs what would happen)
+      - Podcast Job ID: ensures sequential 4-digit ID allocated and persisted before processing
 
     Returns result dict with row_num, status, valid, error etc.
     """
@@ -185,7 +350,31 @@ def process_transcript_row(ws, row: Dict, dry_run: bool = False) -> Dict:
     orig_status = row.get("status", "")
     log.info("Row %d (Status=%s) -> YouTube Link=%r", row_num, orig_status, yt_link)
 
-    result = fetch_and_save_transcript(yt_link)
+    # Podcast Job ID: allocate if empty, preserve existing, never reassign on retry
+    # Only allocate for rows that have a YouTube Link and are entering processing (NEW/TEST_OK or empty ID with NEW)
+    # Use centralized allocate_next_podcast_id via _ensure_podcast_id
+    podcast_id = None
+    record = row.get("record", {})
+    current_id = str(record.get("ID", "")).strip() if isinstance(record, dict) else ""
+    if not current_id:
+        current_id = str(row.get("id", "")).strip()
+    # Only allocate if ID is empty/invalid and row has a YouTube Link (avoid allocating for invalid rows that will fail)
+    # But even for invalid links, we could allocate? Requirement says when new YouTube row enters pipeline and ID empty, assign next ID before processing
+    # So for any row that is being processed (process_transcript_row called), if ID empty, allocate
+    if not _is_valid_podcast_id(current_id) and yt_link.strip():
+        podcast_id = _ensure_podcast_id(ws, row, dry_run=dry_run)
+        log.info("Row %d using Podcast ID %s (YouTube %r)", row_num, podcast_id, yt_link[:40])
+    else:
+        # Preserve existing valid ID (padded for filename)
+        if _is_valid_podcast_id(current_id):
+            try:
+                podcast_id = f"{int(current_id):04d}"
+            except:
+                podcast_id = current_id.strip()
+        else:
+            podcast_id = None
+
+    result = fetch_and_save_transcript(yt_link, podcast_id=podcast_id)
     timestamp = _ist_timestamp()
 
     if result["valid"]:
@@ -294,29 +483,99 @@ def run_transcript_pipeline(dry_run: bool = False, limit: Optional[int] = None, 
 # ---------------------------------------------------------------------------
 # Phase 4 Milestone 2: Audio pipeline — Transcript/Script -> Piper TTS -> Drive -> Audio Link
 # ---------------------------------------------------------------------------
-def _audio_output_path(video_id: str, title: str = "", row_id: str = "") -> Path:
-    """Deterministic, safe MP3 path for audio pipeline.
+def _audio_output_path(podcast_id: str, title: str = "", duration_seconds: float = None) -> Path:
+    """Human-readable deterministic MP3 path: <ID>_<clean_title>_<duration>.mp3
 
-    - MP3 extension, filesystem-safe via slugify, avoids overwriting where possible
-    - Uses video_id as primary identity (YouTube ID 11 chars, safe), plus slugified title/row_id for readability
-    - Follows existing output_paths convention but deterministic (no date) for sheet pipeline idempotency
-    - Stored under config.OUTPUT_DIR (output/*.mp3, gitignored)
+    - ID must always be at the beginning (4-digit zero-padded, e.g., 0012)
+    - Clean title via filesystem-safe slug (no Windows forbidden chars, normalized)
+    - Duration formatted as MMmSSs from actual generated audio (e.g., 08m15s)
+    - Does NOT include YouTube video ID (remains in Sheet URL / transcript metadata)
+    - Deterministic for same ID/title/duration; reasonably bounded length
+    - For backward compat, if podcast_id is a legacy 11-char video_id, it will still
+      generate but will not satisfy ID-at-beginning requirement — caller must pass podcast_id
     """
-    from src.utils import slugify
+    from src.utils import clean_title_for_filename, format_duration_mm_ss
     import re
-    # Base is video_id, optionally with row_id and slugified title for identity
-    base = video_id.strip()
-    if row_id and row_id.strip():
-        # Row ID first for sheet traceability, but keep video_id primary
-        base = f"{row_id.strip()}_{base}"
-    if title and title.strip():
-        # Avoid raw arbitrary titles: slugify, max 20 chars, filesystem-safe
-        base += f"_{slugify(title.strip(), 20)}"
-    # Extra safety: replace any remaining unsafe chars
-    base = re.sub(r"[^\w\-]", "_", base)
-    # Avoid empty or too long
-    base = base[:80] or video_id
+    pid = str(podcast_id).strip() if podcast_id is not None else ""
+    # Validate podcast ID; if invalid, fallback to 0000 with warning (should not happen after allocation)
+    if not _is_valid_podcast_id(pid):
+        log.warning("Invalid podcast_id %r for audio path, using 0000 (should be 4-digit)", pid)
+        # If pid looks like video_id (11 chars), we still need ID at beginning — use 0000 to avoid leaking video_id
+        # Caller should have allocated valid ID; this is fallback for legacy tests
+        if pid and len(pid) == 11 and re.fullmatch(r"[A-Za-z0-9_-]{11}", pid):
+            pid = "0000"
+        elif not pid:
+            pid = "0000"
+        else:
+            # Keep as is but ensure 4-digit? If pid is "1", format to 4 digits
+            try:
+                num = int(pid)
+                pid = f"{num:04d}"
+            except:
+                pid = "0000"
+    clean = clean_title_for_filename(title, max_len=60)
+    base = f"{pid}_{clean}"
+    if duration_seconds is not None:
+        try:
+            dur_str = format_duration_mm_ss(duration_seconds)
+            base = f"{base}_{dur_str}"
+        except Exception:
+            pass
+    # Keep reasonably bounded: total base <=80 chars
+    if len(base) > 80:
+        excess = len(base) - 80
+        # Truncate clean part to fit
+        clean_truncated = clean[:max(1, len(clean) - excess)]
+        clean_truncated = clean_truncated.rstrip("_-")
+        base = f"{pid}_{clean_truncated}"
+        if duration_seconds is not None:
+            try:
+                base = f"{base}_{dur_str}"
+            except:
+                pass
+    # Final safety: ensure no leftover unsafe chars (clean already safe, pid digits, dur safe)
+    base = re.sub(r"[^\w-]", "_", base)
+    base = re.sub(r"_+", "_", base).strip("_")
+    if not base:
+        base = f"{pid}_untitled"
+        if duration_seconds is not None:
+            base = f"{base}_{dur_str}"
     return config.OUTPUT_DIR / f"{base}.mp3"
+
+def _transcript_output_path(podcast_id: str, title: str = "") -> Path:
+    """Human-readable transcript path: <ID>_<clean_title>.txt (and .json)
+
+    - ID at beginning, 4-digit
+    - Clean title via filesystem-safe slug
+    - Does not include video_id in filename (remains in metadata)
+    """
+    from src.utils import clean_title_for_filename
+    pid = str(podcast_id).strip() if podcast_id is not None else ""
+    if not _is_valid_podcast_id(pid):
+        log.warning("Invalid podcast_id %r for transcript path, using 0000", pid)
+        try:
+            num = int(pid)
+            pid = f"{num:04d}"
+        except:
+            pid = "0000"
+    clean = clean_title_for_filename(title, max_len=60)
+    base = f"{pid}_{clean}"
+    if len(base) > 80:
+        excess = len(base) - 80
+        clean_truncated = clean[:max(1, len(clean) - excess)]
+        clean_truncated = clean_truncated.rstrip("_-")
+        base = f"{pid}_{clean_truncated}"
+    import re
+    base = re.sub(r"[^\w-]", "_", base)
+    base = re.sub(r"_+", "_", base).strip("_")
+    if not base:
+        base = f"{pid}_untitled"
+    return config.TRANSCRIPT_DIR / f"{base}.txt"
+
+def _transcript_json_path(podcast_id: str, title: str = "") -> Path:
+    """Corresponding JSON path for transcript metadata."""
+    txt_path = _transcript_output_path(podcast_id, title)
+    return txt_path.with_suffix(".json")
 
 def _is_valid_audio_link(link: str) -> bool:
     """Check if Audio Link is a valid Drive webViewLink (for idempotency)."""
@@ -456,14 +715,55 @@ def process_audio_row(ws, row: Dict, dry_run: bool = False) -> Dict:
             raise
         return {"row_num": row_num, "youtube_link": yt_link, "status": "AUDIO_FAILED", "valid": False, "error": err, "error_type": "InvalidLink", "timestamp": timestamp}
 
-    # Load transcript: prefer local file output/transcripts/<video_id>.txt (from transcript pipeline)
+    # Ensure Podcast ID for transcript lookup (should have been allocated at transcript stage)
+    podcast_id = str(record.get("ID", "")).strip() or str(row.get("id", "")).strip()
+    if not _is_valid_podcast_id(podcast_id) and yt_link.strip():
+        # Allocate if still empty (e.g., legacy row with empty ID that reached audio stage)
+        podcast_id = _ensure_podcast_id(ws, row, dry_run=dry_run)
+        # Update record for downstream
+        record["ID"] = podcast_id
+        row["id"] = podcast_id
+    # Load transcript: try ID-based human-readable first, then legacy video_id, then Transcript Link
     transcript_text = ""
-    transcript_path = config.TRANSCRIPT_DIR / f"{video_id}.txt"
-    if transcript_path.exists():
+    transcript_path = None
+    # Try ID-based transcript (new human-readable)
+    if _is_valid_podcast_id(podcast_id):
         try:
-            transcript_text = transcript_path.read_text(encoding="utf-8").strip()
+            # Use helper to get expected ID-based path (with clean title)
+            id_based_path = _transcript_output_path(podcast_id, title)
+            if id_based_path.exists():
+                transcript_text = id_based_path.read_text(encoding="utf-8").strip()
+                transcript_path = id_based_path
+            else:
+                # Also try glob for any file starting with podcast_id_*.txt (in case title changed)
+                import glob
+                candidates = list(config.TRANSCRIPT_DIR.glob(f"{podcast_id}_*.txt"))
+                if candidates:
+                    # Prefer most recent
+                    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+                    for cand in candidates:
+                        try:
+                            txt = cand.read_text(encoding="utf-8").strip()
+                            if txt and len(txt) > 50:
+                                transcript_text = txt
+                                transcript_path = cand
+                                log.info("Loaded transcript via glob ID-based %s", cand.name)
+                                break
+                        except Exception:
+                            continue
         except Exception as e:
-            log.warning("Row %d transcript read failed %s: %s", row_num, transcript_path, e)
+            log.debug("ID-based transcript load failed for %s: %s", podcast_id, e)
+    # Fallback: legacy video_id based
+    if not transcript_text:
+        legacy_path = config.TRANSCRIPT_DIR / f"{video_id}.txt"
+        if legacy_path.exists():
+            try:
+                transcript_text = legacy_path.read_text(encoding="utf-8").strip()
+                transcript_path = legacy_path
+            except Exception as e:
+                log.warning("Row %d transcript read failed %s: %s", row_num, legacy_path, e)
+        else:
+            transcript_path = legacy_path
     # Fallback: try Transcript Link if it's a local path
     if not transcript_text and transcript_link:
         try:
@@ -473,10 +773,11 @@ def process_audio_row(ws, row: Dict, dry_run: bool = False) -> Dict:
                 p = config.BASE_DIR / p
             if p.exists():
                 transcript_text = p.read_text(encoding="utf-8").strip()
+                transcript_path = p
         except Exception:
             pass
     if not transcript_text:
-        err = f"Transcript not found for video_id={video_id} (need TRANSCRIPT_DONE with local {transcript_path})"
+        err = f"Transcript not found for video_id={video_id} podcast_id={podcast_id} (need {transcript_path})"
         log.warning("Row %d AUDIO_FAILED [TranscriptMissing] %s", row_num, err)
         if dry_run:
             log.info("[DRY-RUN] Row %d would -> AUDIO_FAILED | Error=[TranscriptMissing] %s | Updated At=%s", row_num, err[:80], timestamp)
@@ -493,10 +794,14 @@ def process_audio_row(ws, row: Dict, dry_run: bool = False) -> Dict:
 
     # Dry-run: simulate without side effects (no MP3, no Drive, no sheet write)
     if dry_run:
-        mp3_path = _audio_output_path(video_id, title, row_id)
+        # Use deterministic ID-based filename with placeholder duration for dry-run
+        try:
+            mp3_path = _audio_output_path(podcast_id, title, duration_seconds=None)
+        except Exception:
+            mp3_path = config.OUTPUT_DIR / f"{podcast_id}_dryrun.mp3"
         fake_link = f"dry-run://{mp3_path.name}"
         log.info("[DRY-RUN] Row %d would -> AUDIO_DONE | Audio Link=%s | mp3=%s | Updated At=%s", row_num, fake_link, mp3_path, timestamp)
-        return {"row_num": row_num, "youtube_link": yt_link, "status": "AUDIO_DONE", "valid": True, "dry_run": True, "would_status": "AUDIO_DONE", "audio_link": fake_link, "mp3_path": str(mp3_path), "video_id": video_id, "timestamp": timestamp}
+        return {"row_num": row_num, "youtube_link": yt_link, "status": "AUDIO_DONE", "valid": True, "dry_run": True, "would_status": "AUDIO_DONE", "audio_link": fake_link, "mp3_path": str(mp3_path), "video_id": video_id, "podcast_id": podcast_id, "timestamp": timestamp}
 
     # Generate Telugu script (existing abstraction, rule-based fallback preserved)
     try:
@@ -516,15 +821,41 @@ def process_audio_row(ws, row: Dict, dry_run: bool = False) -> Dict:
             raise
         return {"row_num": row_num, "youtube_link": yt_link, "status": "AUDIO_FAILED", "valid": False, "error": err, "error_type": "ScriptFailed", "timestamp": timestamp}
 
-    # Generate MP3 via existing TTS (Piper primary, Anjali→padmavathi, Ravi→venkatesh)
-    mp3_path = _audio_output_path(video_id, title, row_id)
+    # Generate MP3 via existing TTS (Piper primary) — temp file then human-readable ID-based filename with duration
+    import tempfile
+    tmp_mp3 = Path(tempfile.gettempdir()) / f"podcast_{podcast_id}_{video_id}_tmp.mp3"
+    mp3_path = tmp_mp3  # default for error reporting, will be updated to final after move
     try:
         from src.tts import generate_podcast_mp3
+        tmp_mp3.parent.mkdir(parents=True, exist_ok=True)
+        log.info("Row %d generating MP3 via piper: %s (podcast %s) -> temp %s (%d turns)", row_num, video_id, podcast_id, tmp_mp3, len(script))
+        generate_podcast_mp3(script, tmp_mp3)
+        if not tmp_mp3.exists() or tmp_mp3.stat().st_size == 0:
+            raise RuntimeError(f"MP3 not created or empty: {tmp_mp3}")
+        # Measure actual duration for human-readable filename (MMmSSs)
+        try:
+            from pydub import AudioSegment
+            audio = AudioSegment.from_file(str(tmp_mp3))
+            duration_seconds = len(audio) / 1000.0
+        except Exception as e:
+            log.warning("Could not measure MP3 duration for %s: %s, using 0", tmp_mp3, e)
+            duration_seconds = 0
+        # Create final human-readable path: <ID>_<clean_title>_<duration>.mp3
+        mp3_path = _audio_output_path(podcast_id, title, duration_seconds)
         mp3_path.parent.mkdir(parents=True, exist_ok=True)
-        log.info("Row %d generating MP3 via piper: %s -> %s (%d turns)", row_num, video_id, mp3_path, len(script))
-        generate_podcast_mp3(script, mp3_path)
+        # Deterministic for same ID/title/duration — reuse if already exists
+        if mp3_path.exists() and mp3_path.stat().st_size > 0:
+            log.info("Final MP3 already exists, reusing %s", mp3_path)
+            try:
+                tmp_mp3.unlink()
+            except:
+                pass
+        else:
+            import shutil
+            shutil.move(str(tmp_mp3), str(mp3_path))
+            log.info("MP3 moved to final human-readable path: %s (%.1fs, %s)", mp3_path, duration_seconds, _format_duration_mm_ss(duration_seconds))
         if not mp3_path.exists() or mp3_path.stat().st_size == 0:
-            raise RuntimeError(f"MP3 not created or empty: {mp3_path}")
+            raise RuntimeError(f"Final MP3 not created or empty: {mp3_path}")
     except Exception as e:
         err = f"TTS failed: {e}"
         log.warning("Row %d AUDIO_FAILED [TTSFailed] %s", row_num, err)
@@ -706,6 +1037,28 @@ def process_pipeline_row(ws, row: Dict, dry_run: bool = False) -> Dict:
     if status_upper == "AUDIO_DONE" and _is_valid_audio_link(audio_link_existing):
         log.info("Row %d already AUDIO_DONE with valid Audio Link, skipping (pipeline)", row_num)
         return {"row_num": row_num, "status": "AUDIO_DONE", "skipped": True, "audio_link": audio_link_existing, "valid": True}
+
+    # Podcast Job ID: ensure allocated before processing (centralized, sequential 4-digit)
+    # Preserve existing valid ID, allocate next sequential if empty/invalid, never reassign on retry
+    yt_for_id = str(record.get("YouTube Link", "")).strip() or str(row.get("youtube_link", row.get("url", ""))).strip()
+    current_podcast_id = str(record.get("ID", "")).strip() or str(row.get("id", "")).strip()
+    if not _is_valid_podcast_id(current_podcast_id) and yt_for_id:
+        # Allocate next sequential ID (MAX+1) and persist (unless dry_run)
+        allocated = _ensure_podcast_id(ws, row, dry_run=dry_run)
+        record["ID"] = allocated
+        row["id"] = allocated
+        row["record"] = record
+        log.info("Row %d allocated Podcast ID %s for YouTube %r", row_num, allocated, yt_for_id[:40])
+    elif _is_valid_podcast_id(current_podcast_id):
+        # Normalize to padded for internal use but preserve sheet value
+        try:
+            padded = f"{int(current_podcast_id):04d}"
+            # Keep record as padded for downstream filename generation (sheet retains original if not padded, but we use padded internally)
+            record["ID"] = padded
+            row["id"] = padded
+            row["record"] = record
+        except:
+            pass
 
     # Dry-run: report what would happen, no external calls
     if dry_run:

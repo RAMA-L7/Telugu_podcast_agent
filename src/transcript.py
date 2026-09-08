@@ -71,18 +71,29 @@ def validate_youtube_link(youtube_url: Optional[str]) -> str:
 # ---------------------------------------------------------------------------
 # Local save — output/transcripts/<video_id>.txt + .json
 # ---------------------------------------------------------------------------
+def _is_valid_podcast_id_local(id_str: str) -> bool:
+    """Local helper to avoid circular import — checks if podcast ID is valid 4-digit numeric."""
+    s = str(id_str).strip() if id_str is not None else ""
+    return s.isdigit() and int(s) > 0 if s.isdigit() else False
+
 def save_transcript_locally(
     video_id: str,
     transcript: str,
     youtube_url: str,
     title: str = "",
     extra: Optional[Dict] = None,
+    podcast_id: Optional[str] = None,
 ) -> Dict[str, Path]:
     """Save transcript locally under config.TRANSCRIPT_DIR.
 
+    Human-readable ID-based naming: <ID>_<clean_title>.txt
+    - If podcast_id is valid (4-digit), uses ID-based filename
+    - Else falls back to legacy <video_id>.txt for backward compat
+    - Keeps YouTube video ID in metadata for traceability (Podcast ID -> Video ID -> transcript)
+
     Creates:
-        output/transcripts/<video_id>.txt  — raw transcript text
-        output/transcripts/<video_id>.json — metadata + transcript (for pipeline)
+        output/transcripts/<ID>_<clean_title>.txt  — raw transcript text (or legacy <video_id>.txt)
+        output/transcripts/<ID>_<clean_title>.json — metadata + transcript (for pipeline)
 
     Returns dict with keys txt_path, json_path. Caller may use these to set
     sheet Transcript Link only after this succeeds (sheet-safe pattern).
@@ -90,11 +101,32 @@ def save_transcript_locally(
     Raises only on disk errors (caller decides whether to surface as sheet Error).
     """
     import config
+    from src.utils import clean_title_for_filename
     transcript_dir = Path(config.TRANSCRIPT_DIR)
     transcript_dir.mkdir(parents=True, exist_ok=True)
 
-    txt_path = transcript_dir / f"{video_id}.txt"
-    json_path = transcript_dir / f"{video_id}.json"
+    # Determine filename: prefer ID-based human-readable
+    if podcast_id and _is_valid_podcast_id_local(podcast_id):
+        clean = clean_title_for_filename(title, max_len=60)
+        pid = str(podcast_id).strip()
+        # Ensure 4-digit formatting
+        try:
+            pid = f"{int(pid):04d}"
+        except:
+            pass
+        base = f"{pid}_{clean}"
+        if len(base) > 80:
+            # Truncate clean part
+            excess = len(base) - 80
+            clean_truncated = clean[:max(1, len(clean) - excess)]
+            clean_truncated = clean_truncated.rstrip("_-")
+            base = f"{pid}_{clean_truncated}"
+        txt_path = transcript_dir / f"{base}.txt"
+        json_path = transcript_dir / f"{base}.json"
+    else:
+        # Legacy fallback: video_id based (for tests and backward compat)
+        txt_path = transcript_dir / f"{video_id}.txt"
+        json_path = transcript_dir / f"{video_id}.json"
 
     ist = timezone(timedelta(hours=5, minutes=30))
     fetched_at = datetime.now(ist).strftime("%Y-%m-%d %H:%M:%S IST")
@@ -103,7 +135,7 @@ def save_transcript_locally(
     txt_path.write_text(transcript, encoding="utf-8")
     log.info("Saved transcript txt: %s (%d chars)", txt_path, len(transcript))
 
-    # json metadata
+    # json metadata — include podcast_id for traceability if available
     meta = {
         "video_id": video_id,
         "youtube_url": youtube_url,
@@ -113,9 +145,19 @@ def save_transcript_locally(
         "fetched_at": fetched_at,
         "source": extra.get("source") if extra else "unknown",
     }
+    # Add podcast_id to meta if provided (traceability: Podcast ID -> Video ID -> transcript)
+    if podcast_id and _is_valid_podcast_id_local(podcast_id):
+        try:
+            meta["podcast_id"] = f"{int(str(podcast_id).strip()):04d}"
+        except:
+            meta["podcast_id"] = str(podcast_id).strip()
+        meta["podcast_id_raw"] = str(podcast_id).strip()
     payload = {"meta": meta, "transcript": transcript}
     if extra:
         payload["extra"] = extra
+    # Also include podcast_id at top level for convenience
+    if podcast_id and _is_valid_podcast_id_local(podcast_id):
+        payload["podcast_id"] = meta["podcast_id"]
     json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     log.info("Saved transcript json: %s", json_path)
 
@@ -261,6 +303,7 @@ def fetch_transcript(youtube_url: str, max_chars: int = 12000) -> Tuple[str, str
 def fetch_and_save_transcript(
     youtube_url: str,
     max_chars: int = 12000,
+    podcast_id: Optional[str] = None,
 ) -> Dict:
     """Convenience: validate -> fetch -> save locally -> return result dict.
 
@@ -353,6 +396,7 @@ def fetch_and_save_transcript(
         }
 
     # Fetch succeeded — save locally (source will be whisper if captions blocked, otherwise api/yt-dlp)
+    # Use podcast_id for human-readable filename if provided (ID-based)
     try:
         saved = save_transcript_locally(
             video_id=video_id,
@@ -360,6 +404,7 @@ def fetch_and_save_transcript(
             youtube_url=raw.strip(),
             title=title,
             extra={"source": "youtube_transcript_api/yt-dlp/whisper"},
+            podcast_id=podcast_id,
         )
         return {
             "valid": True,

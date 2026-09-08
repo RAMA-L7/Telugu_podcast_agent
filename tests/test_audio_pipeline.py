@@ -217,17 +217,33 @@ def test_f_sheet_schema_12_columns():
     print("PASS: test_f_sheet_schema_12_columns")
 
 def test_audio_output_path_deterministic():
-    """File naming: deterministic, safe, MP3 extension, filesystem-safe, preserves identity."""
+    """File naming: deterministic, human-readable ID-based with duration, filesystem-safe."""
     from src.sheet_monitor import _audio_output_path
-    p1 = _audio_output_path("dQw4w9WgXcQ", "My Video Title!", "1")
-    p2 = _audio_output_path("dQw4w9WgXcQ", "My Video Title!", "1")
-    assert p1 == p2, "Should be deterministic"
+    # Same ID/title/duration should be deterministic
+    p1 = _audio_output_path("0012", "How I'm Helping Thousands Rebuild Their Lives After Prison!", 495)
+    p2 = _audio_output_path("0012", "How I'm Helping Thousands Rebuild Their Lives After Prison!", 495)
+    assert p1 == p2, "Should be deterministic for same ID/title/duration"
     assert p1.suffix == ".mp3"
-    assert "dQw4w9WgXcQ" in p1.name
-    assert "/" not in p1.name and "\\" not in p1.name and ":" not in p1.name
-    p3 = _audio_output_path("abc123", "Title with / slashes and * stars!", "2")
+    assert p1.name.startswith("0012_"), f"Audio filename must begin with Podcast ID, got {p1.name}"
+    assert "dQw4w9WgXcQ" not in p1.name, "Video ID must not be in human-facing filename"
+    assert "08m15s" in p1.name, f"Duration 495s should be 08m15s, got {p1.name}"
+    assert "/" not in p1.name and "\\" not in p1.name and ":" not in p1.name and "*" not in p1.name
+    # Title sanitized, duration formatted
+    p3 = _audio_output_path("0005", "Title with / slashes and * stars!  ", 65)
     assert "/" not in p3.name
     assert "*" not in p3.name
+    assert p3.name.startswith("0005_")
+    assert "01m05s" in p3.name, f"65s should be 01m05s, got {p3.name}"
+    # Different duration should give different filename for same ID/title
+    p4 = _audio_output_path("0012", "Same Title", 100)
+    p5 = _audio_output_path("0012", "Same Title", 200)
+    assert p4 != p5, "Different durations should give different filenames"
+    assert "01m40s" in p4.name  # 100s = 01m40s
+    assert "03m20s" in p5.name  # 200s = 03m20s
+    # Clean title, no unsafe chars
+    p6 = _audio_output_path("0001", 'Test: Title with <bad> chars "yes" | pipe', 10)
+    assert "<" not in p6.name and ">" not in p6.name and ":" not in p6.name and '"' not in p6.name and "|" not in p6.name
+    assert p6.name.startswith("0001_")
     print("PASS: test_audio_output_path_deterministic")
 
 def test_script_done_not_pending():
