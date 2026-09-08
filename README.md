@@ -283,6 +283,8 @@ Watcher notes: polls via `src/watcher.py` → `src/sheet_monitor.run_pipeline()`
 - **Restart:** `AUDIO_DONE+valid link` → skipped (idempotent, no duplicate Drive upload), `AUDIO_FAILED` → retry after backoff interval per `Updated At`, survives restart via sheet state.
 - **Config:** `WATCH_INTERVAL_SECONDS=30`, `MAX_RETRIES=3`, `RETRY_BASE_DELAY_SECONDS=2`, `RETRY_MAX_DELAY_SECONDS=30` in `config.py` + `.env.example`, validated.
 
+> **Production:** For operational runbook, see [`docs/production-runbook.md`](docs/production-runbook.md) (prerequisites, `WATCH_INTERVAL_SECONDS`, `MAX_RETRIES`, watcher ` --watch`/`--dry-run`/`--interval`/`--limit`, `Ctrl+C` shutdown, status flow, retry/backoff, troubleshooting, checklist).
+
 ---
 
 ## 🔊 Telugu TTS Engines (Roadmap — Open-Source-First, Fully Offline Default)
