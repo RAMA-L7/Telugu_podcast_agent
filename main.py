@@ -49,14 +49,19 @@ def process_url(youtube_url: str, dry_run: bool = False) -> dict:
     generate_podcast_mp3(script, mp3_path)
     log.info("MP3 ready: %s (%.1f KB)", mp3_path, mp3_path.stat().st_size / 1024)
 
-    # 4. Drive upload
+    # 4. Drive upload (provider-agnostic, secure: not public by default)
     drive_link = ""
     if dry_run:
         log.info("Dry-run: skipping Drive upload")
         drive_link = f"dry-run://{mp3_path.name}"
     else:
         try:
-            drive_link = upload_to_drive(mp3_path)
+            res = upload_to_drive(mp3_path)
+            # upload_to_drive returns dict {fileId, webViewLink} (secure, not public by default)
+            if isinstance(res, dict):
+                drive_link = res.get("webViewLink") or res.get("link") or f"https://drive.google.com/file/d/{res.get('fileId')}/view"
+            else:
+                drive_link = str(res)
         except Exception as e:
             log.warning("Drive upload failed (saving locally): %s", e)
             drive_link = f"local://{mp3_path.absolute()}"

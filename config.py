@@ -37,11 +37,19 @@ SHEET_NAME = os.getenv("SHEET_NAME", "Sheet1")
 DRIVE_FOLDER_ID = os.getenv("DRIVE_OUTPUT_FOLDER_ID", "") or os.getenv("DRIVE_FOLDER_ID", "") or None
 DRIVE_OUTPUT_FOLDER_ID = DRIVE_FOLDER_ID
 
-# Preferred: GOOGLE_CREDENTIALS_FILE, fallback: GOOGLE_CREDENTIALS_PATH
+# Preferred: GOOGLE_CREDENTIALS_FILE, fallback: GOOGLE_CREDENTIALS_PATH — Sheets service-account (unchanged)
 _raw_creds = os.getenv("GOOGLE_CREDENTIALS_FILE", "") or os.getenv("GOOGLE_CREDENTIALS_PATH", "credentials/service_account.json")
 GOOGLE_CREDENTIALS_PATH = Path(_raw_creds)
 GOOGLE_CREDENTIALS_FILE = GOOGLE_CREDENTIALS_PATH  # alias
 GOOGLE_TOKEN_PATH = Path(os.getenv("GOOGLE_TOKEN_PATH", "credentials/token.json"))
+
+# Drive OAuth — separate from Sheets service-account (personal Gmail, no Shared Drives)
+# Uses credentials/drive_oauth_client.json (OAuth client ID Desktop) + credentials/drive_oauth_token.json
+GOOGLE_DRIVE_OAUTH_CLIENT_FILE = Path(os.getenv("GOOGLE_DRIVE_OAUTH_CLIENT_FILE", "credentials/drive_oauth_client.json"))
+GOOGLE_DRIVE_OAUTH_TOKEN_FILE = Path(os.getenv("GOOGLE_DRIVE_OAUTH_TOKEN_FILE", "credentials/drive_oauth_token.json"))
+# Backward compat aliases
+DRIVE_OAUTH_CLIENT_FILE = GOOGLE_DRIVE_OAUTH_CLIENT_FILE
+DRIVE_OAUTH_TOKEN_FILE = GOOGLE_DRIVE_OAUTH_TOKEN_FILE
 
 # LLM — Phase 2 Milestone 3: Gemini 3.5 Flash primary, Ollama optional fallback
 # Default provider: gemini (requires GEMINI_API_KEY), default model: gemini-3.5-flash
