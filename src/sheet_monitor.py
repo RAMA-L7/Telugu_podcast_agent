@@ -596,6 +596,206 @@ def run_audio_pipeline(dry_run: bool = False, limit: Optional[int] = None, ws=No
     log.info("Audio pipeline complete: %d done, %d failed, %d skipped (dry_run=%s)", summary["done"], summary["failed"], summary["skipped"], dry_run)
     return summary
 
+# ---------------------------------------------------------------------------
+# Phase 5.1: Full pipeline orchestration — NEW -> TRANSCRIPT_DONE -> AUDIO_DONE
+# ---------------------------------------------------------------------------
+def fetch_pipeline_pending_rows(ws=None) -> List[Dict]:
+    """Fetch rows needing full pipeline processing.
+
+    Primary input is Status=NEW. Also handles restart safety:
+    - NEW / TEST_OK -> needs transcript + audio
+    - TRANSCRIPT_DONE -> transcript already done, needs audio
+    - AUDIO_FAILED -> retryable audio
+
+    Skips AUDIO_DONE with valid Drive link (idempotency).
+    Uses exact 12-col schema.
+
+    Returns list with row_num, status, record, url, etc.
+    """
+    ws = ws or get_sheet()
+    records = ws.get_all_records()
+    pending = []
+    for idx, row in enumerate(records, start=2):
+        status = str(row.get("Status", "")).strip().upper()
+        audio_link = str(row.get("Audio Link", "")).strip()
+        # Idempotency: already done with valid link -> skip
+        if status == "AUDIO_DONE" and _is_valid_audio_link(audio_link):
+            continue
+        # Primary NEW, plus transcript done for restart, plus audio failed retry
+        # Also include TEST_OK for backward compat (transcript pipeline uses it)
+        if status in ("NEW", "TEST_OK", "TRANSCRIPT_DONE", "AUDIO_FAILED"):
+            yt_link = str(row.get("YouTube Link", "")).strip()
+            pending.append({
+                "row_num": idx,
+                "status": status,
+                "record": row,
+                "url": yt_link,
+                "youtube_link": yt_link,
+                "id": str(row.get("ID", "")).strip(),
+                "title": str(row.get("Title", "")).strip(),
+                "audio_link": audio_link,
+                "transcript_link": str(row.get("Transcript Link", "")).strip(),
+            })
+    return pending
+
+def process_pipeline_row(ws, row: Dict, dry_run: bool = False) -> Dict:
+    """Process one row through full pipeline: NEW -> TRANSCRIPT_DONE -> AUDIO_DONE.
+
+    Dry-run: no transcript fetch, no Gemini, no TTS, no Drive, no Sheet mutation.
+    Failure isolation:
+      - Transcript fails -> TRANSCRIPT_FAILED, no audio
+      - Audio fails after transcript success -> AUDIO_FAILED, preserve Transcript Link
+    Idempotency: AUDIO_DONE+valid link is skipped (handled by fetch, also checked here).
+
+    Only returns AUDIO_DONE after transcript + audio + sheet all succeed.
+    """
+    row_num = row["row_num"]
+    record = row.get("record", {})
+    orig_status = str(record.get("Status", "")).strip()
+    status_upper = orig_status.strip().upper()
+    audio_link_existing = str(record.get("Audio Link", "")).strip()
+
+    # Idempotency check (also in fetch, but double-check for direct calls)
+    if status_upper == "AUDIO_DONE" and _is_valid_audio_link(audio_link_existing):
+        log.info("Row %d already AUDIO_DONE with valid Audio Link, skipping (pipeline)", row_num)
+        return {"row_num": row_num, "status": "AUDIO_DONE", "skipped": True, "audio_link": audio_link_existing, "valid": True}
+
+    # Dry-run: report what would happen, no external calls
+    if dry_run:
+        # Determine would-be transition
+        if status_upper in ("NEW", "TEST_OK"):
+            would = "NEW -> TRANSCRIPT_DONE -> AUDIO_DONE"
+        elif status_upper in ("TRANSCRIPT_DONE", "AUDIO_FAILED"):
+            would = f"{status_upper} -> AUDIO_DONE"
+        else:
+            would = f"{status_upper} -> UNKNOWN"
+        log.info("[DRY-RUN] Row %d (%s) would -> %s", row_num, orig_status, would)
+        return {"row_num": row_num, "status": status_upper, "would_status": would, "dry_run": True, "valid": True}
+
+    # Stage 1: Transcript if needed (NEW / TEST_OK)
+    # Reuse existing transcript logic via process_transcript_row
+    # But we need to handle the case where status is already TRANSCRIPT_DONE/AUDIO_FAILED -> skip transcript
+    transcript_done = False
+    if status_upper in ("NEW", "TEST_OK"):
+        log.info("[Row %d] NEW -> fetching transcript", row_num)
+        # Call existing transcript row processing (reuses validation, file persistence, sheet update)
+        t_result = process_transcript_row(ws, row, dry_run=False)
+        # process_transcript_row already updated sheet and returned result
+        if not t_result.get("valid"):
+            # Transcript failed -> return TRANSCRIPT_FAILED, do not proceed to audio
+            log.info("[Row %d] TRANSCRIPT_FAILED: %s", row_num, t_result.get("error"))
+            return t_result  # Already has status TRANSCRIPT_FAILED, error, etc.
+        # Transcript succeeded -> update in-memory record for audio stage
+        # The sheet now has TRANSCRIPT_DONE, but row dict still has old status; update it
+        transcript_done = True
+        # Update record to reflect new status for audio stage
+        record["Status"] = "TRANSCRIPT_DONE"
+        record["Transcript Link"] = t_result.get("transcript_link", "")
+        if t_result.get("title"):
+            record["Title"] = t_result["title"]
+        # Also update row status for next check
+        status_upper = "TRANSCRIPT_DONE"
+        log.info("[Row %d] TRANSCRIPT_DONE -> generating audio", row_num)
+    elif status_upper in ("TRANSCRIPT_DONE", "AUDIO_FAILED"):
+        transcript_done = True
+        log.info("[Row %d] %s -> generating audio (transcript already done)", row_num, orig_status)
+    else:
+        # Unexpected status, treat as needing transcript
+        log.warning("Row %d unexpected status %s for pipeline, attempting transcript", row_num, orig_status)
+        t_result = process_transcript_row(ws, row, dry_run=False)
+        if not t_result.get("valid"):
+            return t_result
+        transcript_done = True
+        record["Status"] = "TRANSCRIPT_DONE"
+        status_upper = "TRANSCRIPT_DONE"
+
+    if not transcript_done:
+        # Should not happen, but safety
+        return {"row_num": row_num, "status": "AUDIO_FAILED", "valid": False, "error": "Transcript not done and not attempted", "error_type": "PipelineError"}
+
+    # Stage 2: Audio (refresh row dict to ensure audio pipeline sees correct status/record)
+    # Build audio row from updated record
+    yt_link = str(record.get("YouTube Link", "")).strip() or row.get("youtube_link", "")
+    audio_row = {
+        "row_num": row_num,
+        "status": status_upper,
+        "record": record,
+        "url": yt_link,
+        "youtube_link": yt_link,
+        "id": str(record.get("ID", "")).strip(),
+        "title": str(record.get("Title", "")).strip(),
+        "audio_link": str(record.get("Audio Link", "")).strip(),
+        "transcript_link": str(record.get("Transcript Link", "")).strip(),
+    }
+    # Reuse existing audio logic (handles TTS, Drive, sheet update, failure isolation, idempotency)
+    a_result = process_audio_row(ws, audio_row, dry_run=False)
+    return a_result
+
+def run_pipeline(dry_run: bool = False, limit: Optional[int] = None, ws=None) -> Dict:
+    """Run full pipeline for NEW rows through to AUDIO_DONE (orchestration).
+
+    - Fetches pending via fetch_pipeline_pending_rows() (NEW/TEST_OK/TRANSCRIPT_DONE/AUDIO_FAILED, skips AUDIO_DONE+valid link)
+    - For each, calls process_pipeline_row (dry_run logs without external calls)
+    - Returns summary with done/failed/skipped.
+
+    Dry-run performs NO YouTube fetch, NO Gemini, NO TTS, NO Drive, NO sheet writes — only reads sheet.
+    Limit applies deterministically to pending list.
+
+    Reuses existing transcript/audio functions, does not duplicate Drive OAuth or Piper logic.
+    """
+    ws = ws or get_sheet()
+    header = ws.row_values(1)
+    if header != config.SHEET_HEADER:
+        log.warning("Header mismatch for pipeline — continuing without modification. Expected %s", config.SHEET_HEADER)
+    pending = fetch_pipeline_pending_rows(ws)
+    log.info("Pipeline: %d rows pending (NEW/TRANSCRIPT_DONE/AUDIO_FAILED, skipping AUDIO_DONE+valid link)", len(pending))
+    if limit is not None:
+        pending = pending[:limit]
+        log.info("Limited to first %d rows", limit)
+    summary = {
+        "header": header,
+        "total_pending": len(pending),
+        "processed": 0,
+        "done": 0,
+        "failed": 0,
+        "skipped": 0,
+        "dry_run": dry_run,
+        "details": [],
+    }
+    if not pending:
+        log.info("No rows to process for pipeline (need NEW/TRANSCRIPT_DONE/AUDIO_FAILED)")
+        return summary
+    for row in pending:
+        try:
+            res = process_pipeline_row(ws, row, dry_run=dry_run)
+            summary["details"].append(res)
+            summary["processed"] += 1
+            # Dry-run: use simulated would_status, not actual status
+            if res.get("skipped"):
+                summary["skipped"] += 1
+            elif dry_run:
+                would = str(res.get("would_status", ""))
+                if "AUDIO_DONE" in would:
+                    summary["done"] += 1
+                else:
+                    # Deterministic dry-run failure (e.g., validation) -> Failed
+                    summary["failed"] += 1
+            elif res.get("status") == "AUDIO_DONE" and res.get("valid"):
+                summary["done"] += 1
+            elif res.get("status") == "TRANSCRIPT_FAILED":
+                summary["failed"] += 1
+            elif res.get("status") == "AUDIO_FAILED":
+                summary["failed"] += 1
+            else:
+                summary["failed"] += 1
+        except Exception as e:
+            log.exception("Unexpected error processing pipeline row %d: %s", row["row_num"], e)
+            summary["details"].append({"row_num": row["row_num"], "valid": False, "error": str(e), "error_type": "Unexpected", "status": "AUDIO_FAILED"})
+            summary["failed"] += 1
+            summary["processed"] += 1
+    log.info("Pipeline complete: %d done, %d failed, %d skipped (dry_run=%s)", summary["done"], summary["failed"], summary["skipped"], dry_run)
+    return summary
+
 def update_row(ws, row_num: int, status: str = "", drive_link: str = "", title: str = "", updated_at: str = "", error: str = "", **kwargs):
     """Update row by exact 12-column header names.
 
