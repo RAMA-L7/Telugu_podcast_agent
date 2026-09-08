@@ -83,6 +83,15 @@ MAX_PODCAST_TURNS = int(os.getenv("MAX_PODCAST_TURNS", "14"))
 TRANSCRIPT_DIR = OUTPUT_DIR / "transcripts"
 TRANSCRIPT_DIR.mkdir(parents=True, exist_ok=True)
 
+# Transcript ASR fallback — when YouTube timedtext is 429/blocked, download audio via yt-dlp
+# and transcribe locally with faster-whisper (CPU, offline). Optional: pip install faster-whisper
+# Enabled by default if faster-whisper is installed; disable with WHISPER_ENABLED=false
+WHISPER_ENABLED = os.getenv("WHISPER_ENABLED", "true").lower() not in ("0", "false", "no", "off", "")
+WHISPER_MODEL_SIZE = os.getenv("WHISPER_MODEL_SIZE", "tiny")  # tiny/base/small/medium - tiny is fastest, base is balanced
+WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cpu")  # cpu or cuda
+WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "int8")  # int8/float16/float32 - int8 for CPU
+WHISPER_LANGUAGE = os.getenv("WHISPER_LANGUAGE", "en")  # en - source is typically English before Telugu translation
+
 # TTS — Piper CPU/offline primary (Anjali: padmavathi-medium, Ravi: venkatesh-medium)
 # Keep piper CPU/offline as primary; edge-tts/gTTS are fallback only (provider-agnostic)
 TTS_ENGINE = os.getenv("TTS_ENGINE", "piper").lower()  # piper (primary, offline) | edge | gtts | coqui

@@ -28,6 +28,11 @@ pydub==0.25.1
 # TTS==0.22.0
 # piper-tts==1.2.0
 
+# Transcript ASR fallback — when YouTube captions 429/blocked, download audio and transcribe locally
+# CPU offline, no API key. Install if you need whisper fallback: pip install faster-whisper
+# tiny=~150MB, base=~300MB, small=~600MB; tiny is enough for English→Telugu pipeline
+# faster-whisper==1.1.0  # optional — only for WHISPER_ENABLED=true (when captions blocked)
+
 # Utils
 tenacity==8.5.0
 tqdm==4.66.5

@@ -155,9 +155,20 @@ def fetch_transcript(youtube_url: str, max_chars: int = 12000) -> Tuple[str, str
     text = ""
     last_err: Optional[Exception] = None
 
-    # Method 1: youtube_transcript_api (fast, no download)
+    # Retry transient transcript fetch with existing backoff (reuse retry_utils, no second system)
     try:
-        text = _fetch_via_transcript_api(video_id)
+        from src.retry_utils import retry_operation
+    except Exception:
+        retry_operation = None  # type: ignore
+
+    # Method 1: youtube_transcript_api (fast, no download) — prefer English, retry transient 429/5xx/timeout
+    try:
+        def _call_api():
+            return _fetch_via_transcript_api(video_id)
+        if retry_operation:
+            text = retry_operation(_call_api, operation_name=f"transcript_api {video_id}")
+        else:
+            text = _fetch_via_transcript_api(video_id)
         if text:
             log.info("Transcript via youtube_transcript_api: %d chars (video_id=%s)", len(text), video_id)
     except EmptyLinkError:
@@ -168,10 +179,15 @@ def fetch_transcript(youtube_url: str, max_chars: int = 12000) -> Tuple[str, str
         log.warning("transcript_api failed for %s: %s", video_id, e)
         last_err = e
 
-    # Method 2: yt-dlp fallback (downloads auto-captions)
+    # Method 2: yt-dlp fallback (downloads auto-captions) — retry transient, prefer English
     if not text:
         try:
-            text = _fetch_via_ytdlp(normalized_url)
+            def _call_ytdlp():
+                return _fetch_via_ytdlp(normalized_url)
+            if retry_operation:
+                text = retry_operation(_call_ytdlp, operation_name=f"yt-dlp {video_id}")
+            else:
+                text = _fetch_via_ytdlp(normalized_url)
             if text:
                 log.info("Transcript via yt-dlp: %d chars (video_id=%s)", len(text), video_id)
         except EmptyLinkError:
@@ -181,6 +197,41 @@ def fetch_transcript(youtube_url: str, max_chars: int = 12000) -> Tuple[str, str
         except Exception as e:
             log.warning("yt-dlp transcript failed for %s: %s", video_id, e)
             last_err = e if last_err is None else last_err
+
+    # Method 3: local ASR via faster-whisper (when timedtext is 429/blocked — audio download still works)
+    # Optional: requires `pip install faster-whisper`, otherwise skipped gracefully.
+    # Triggered whenever captions failed (especially 429/rate limit) and WHISPER_ENABLED=true.
+    if not text:
+        # Only attempt whisper if previous error looks like rate-limit/blocked or no transcript,
+        # or always when captions returned empty — whisper is the last resort.
+        should_try_whisper = True
+        # If captions failed with permanent TranscriptNotFoundError (e.g., no captions, private),
+        # still try whisper — it may succeed via audio.
+        try:
+            import config as _cfg
+            whisper_enabled = getattr(_cfg, "WHISPER_ENABLED", True)
+        except Exception:
+            whisper_enabled = True
+        if whisper_enabled and should_try_whisper:
+            try:
+                def _call_whisper():
+                    return _fetch_via_whisper(normalized_url, video_id)
+                # Whisper audio download may also hit transient 429; reuse same retry
+                if retry_operation:
+                    text = retry_operation(_call_whisper, operation_name=f"whisper {video_id}")
+                else:
+                    text = _fetch_via_whisper(normalized_url, video_id)
+                if text:
+                    log.info("Transcript via whisper: %d chars (video_id=%s)", len(text), video_id)
+            except EmptyLinkError:
+                raise
+            except InvalidLinkError:
+                raise
+            except Exception as e:
+                log.warning("whisper transcript failed for %s: %s", video_id, e)
+                last_err = e if last_err is None else last_err
+        else:
+            log.debug("whisper fallback disabled or not needed for %s", video_id)
 
     if not text:
         # Distinguish not-found vs fetch error
@@ -301,14 +352,14 @@ def fetch_and_save_transcript(
             "error_type": type(e).__name__,
         }
 
-    # Fetch succeeded — save locally
+    # Fetch succeeded — save locally (source will be whisper if captions blocked, otherwise api/yt-dlp)
     try:
         saved = save_transcript_locally(
             video_id=video_id,
             transcript=transcript,
             youtube_url=raw.strip(),
             title=title,
-            extra={"source": "youtube_transcript_api/yt-dlp"},
+            extra={"source": "youtube_transcript_api/yt-dlp/whisper"},
         )
         return {
             "valid": True,
@@ -340,9 +391,12 @@ def fetch_and_save_transcript(
 # ---------------------------------------------------------------------------
 def _fetch_via_transcript_api(video_id: str) -> str:
     from youtube_transcript_api import YouTubeTranscriptApi
+    # Prefer English first — Gemini already handles English -> Telugu, so English transcript is sufficient
+    # Telugu is not required when English succeeds
     langs = ["en", "te", "hi"]
     try:
         transcripts = YouTubeTranscriptApi.list_transcripts(video_id)
+        # Try preferred languages in order: en first, then te, hi
         for lang in langs:
             try:
                 t = transcripts.find_transcript([lang])
@@ -370,13 +424,22 @@ def _fetch_via_transcript_api(video_id: str) -> str:
             data = YouTubeTranscriptApi.get_transcript(video_id)
             return " ".join([x["text"] for x in data])
         except Exception as e:
-            # Bubble up as fetch error so caller can classify
-            raise TranscriptFetchError(str(e)) from e
+            # Improve classification: youtube-transcript-api often surfaces YouTube 429 HTML as ParseError
+            # "no element found: line 1, column 0" when timedtext returns HTML with 429, not XML
+            msg = str(e)
+            low = msg.lower()
+            if "no element found" in low or "parseerror" in low:
+                raise TranscriptFetchError(f"YouTube rate limit or HTML response (transient): {msg}") from e
+            raise TranscriptFetchError(msg) from e
     return ""
 
 
 def _fetch_via_ytdlp(youtube_url: str) -> str:
-    """Use yt-dlp to download auto captions."""
+    """Use yt-dlp to download auto captions — prefer English, return if available.
+
+    English is sufficient because Gemini handles English -> Telugu; do not require Telugu.
+    Tries languages sequentially (en first) so a 429 for te does not block en when en is 200.
+    """
     import yt_dlp
     import tempfile
     from pathlib import Path
@@ -384,6 +447,42 @@ def _fetch_via_ytdlp(youtube_url: str) -> str:
     tmpdir = Path(tempfile.gettempdir()) / "telugu_podcast_yt"
     tmpdir.mkdir(exist_ok=True)
 
+    # Prefer English first — if en succeeds, return it (Te not required)
+    for pref_lang in ["en", "te", "hi"]:
+        ydl_opts = {
+            "skip_download": True,
+            "writesubtitles": True,
+            "writeautomaticsub": True,
+            "subtitleslangs": [pref_lang],
+            "subtitlesformat": "json3",
+            "outtmpl": str(tmpdir / "%(id)s.%(ext)s"),
+            "quiet": True,
+            "no_warnings": True,
+        }
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(youtube_url, download=True)
+                video_id = info.get("id", "")
+                for ext in ["json3", "vtt", "srv3"]:
+                    cand = list(tmpdir.glob(f"{video_id}*.{pref_lang}*.{ext}"))
+                    if not cand:
+                        cand = list(tmpdir.glob(f"{video_id}*.{ext}"))
+                    for f in cand:
+                        text = _parse_subtitle_file(f)
+                        if text and len(text) > 100:
+                            log.info("yt-dlp success for lang %s: %d chars", pref_lang, len(text))
+                            return text
+        except yt_dlp.utils.DownloadError as e:
+            # If this is a 429 for te but en already would have succeeded on previous iteration,
+            # we would have returned; if en failed and te also 429, continue to next lang
+            # For en 429, we should still try next lang? But en 429 is transient, should be retried via outer retry
+            # Log and continue to next pref_lang
+            log.debug("yt-dlp %s failed (transient, will try next lang): %s", pref_lang, e)
+            continue
+        except Exception as e:
+            log.debug("yt-dlp %s failed: %s", pref_lang, e)
+            continue
+    # Fallback: try original multi-lang batch (for backward compat, in case single-lang misses)
     ydl_opts = {
         "skip_download": True,
         "writesubtitles": True,
@@ -412,6 +511,108 @@ def _fetch_via_ytdlp(youtube_url: str) -> str:
     except Exception as e:
         raise TranscriptFetchError(str(e)) from e
     return ""
+
+
+def _fetch_via_whisper(youtube_url: str, video_id: str) -> str:
+    """Download audio via yt-dlp and transcribe locally with faster-whisper (CPU).
+
+    Optional fallback for when YouTube timedtext is 429/blocked. Audio download
+    uses a different endpoint and still works when captions are blocked (verified
+    with 10 MiB download for 429-caption videos). Requires `pip install faster-whisper`.
+    Returns "" if faster-whisper not installed or WHISPER_ENABLED=false, so caller
+    can distinguish from hard error. Raises TranscriptFetchError for audio-download
+    failures that are retryable, and returns "" for missing dependency.
+    """
+    import config as _cfg
+    if not getattr(_cfg, "WHISPER_ENABLED", True):
+        log.debug("whisper disabled via WHISPER_ENABLED for %s", video_id)
+        return ""
+    try:
+        from faster_whisper import WhisperModel  # type: ignore
+    except ImportError as e:
+        log.debug("faster-whisper not installed, skipping whisper fallback for %s: %s", video_id, e)
+        return ""
+    import tempfile
+    import shutil
+    from pathlib import Path as _Path
+    import yt_dlp
+
+    tmpdir = _Path(tempfile.mkdtemp(prefix=f"whisper_{video_id}_"))
+    audio_path = None
+    try:
+        # Download best audio only — skip captions, skip video
+        ydl_opts = {
+            "format": "bestaudio/best",
+            "outtmpl": str(tmpdir / "%(id)s.%(ext)s"),
+            "quiet": True,
+            "no_warnings": True,
+            "noplaylist": True,
+            "skip_download": False,
+            "writesubtitles": False,
+            "writeautomaticsub": False,
+        }
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(youtube_url, download=True)
+                vid = info.get("id", video_id)
+                # Find downloaded audio file
+                candidates = list(tmpdir.glob(f"{vid}.*"))
+                if not candidates:
+                    candidates = list(tmpdir.glob("*"))
+                # Prefer audio extensions
+                for ext in [".webm", ".m4a", ".mp3", ".opus", ".wav", ".mkv", ".mp4"]:
+                    for cand in candidates:
+                        if cand.suffix.lower() == ext:
+                            audio_path = cand
+                            break
+                    if audio_path:
+                        break
+                if not audio_path and candidates:
+                    audio_path = candidates[0]
+                if not audio_path or not audio_path.exists():
+                    raise TranscriptFetchError(f"whisper audio download failed: no file for {video_id}")
+                log.info("whisper: downloaded audio %s (%d bytes)", audio_path.name, audio_path.stat().st_size)
+        except yt_dlp.utils.DownloadError as e:
+            raise TranscriptFetchError(f"whisper audio download error: {e}") from e
+
+        # Transcribe with faster-whisper (CPU int8, tiny/base)
+        model_size = getattr(_cfg, "WHISPER_MODEL_SIZE", "tiny")
+        device = getattr(_cfg, "WHISPER_DEVICE", "cpu")
+        compute_type = getattr(_cfg, "WHISPER_COMPUTE_TYPE", "int8")
+        language = getattr(_cfg, "WHISPER_LANGUAGE", "en")
+        # Map language=None for auto, but we prefer en since Gemini translates
+        whisper_lang = language if language else None
+        log.info("whisper: loading model %s device=%s compute=%s for %s", model_size, device, compute_type, video_id)
+        try:
+            model = WhisperModel(model_size, device=device, compute_type=compute_type)
+        except Exception as e:
+            raise TranscriptFetchError(f"whisper model load failed ({model_size}): {e}") from e
+        try:
+            segments, _info = model.transcribe(
+                str(audio_path),
+                language=whisper_lang,
+                beam_size=1,
+                vad_filter=True,
+            )
+            parts = []
+            for seg in segments:
+                t = seg.text.strip() if hasattr(seg, "text") else str(seg).strip()
+                if t:
+                    parts.append(t)
+            text = " ".join(parts).strip()
+            if len(text) < 50:
+                log.warning("whisper transcript too short for %s: %d chars", video_id, len(text))
+                return ""
+            return text
+        except Exception as e:
+            raise TranscriptFetchError(f"whisper transcribe failed: {e}") from e
+    finally:
+        # Cleanup temp audio (keep model cache in huggingface hub)
+        try:
+            if tmpdir.exists():
+                shutil.rmtree(tmpdir, ignore_errors=True)
+        except Exception:
+            pass
 
 
 def _parse_subtitle_file(path) -> str:

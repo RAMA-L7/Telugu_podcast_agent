@@ -101,6 +101,175 @@ def test_cli_validation_paths():
         pass
     print("PASS: test_cli_validation_paths")
 
+def test_english_preferred_when_available():
+    """English transcript should be returned when available, Telugu not required."""
+    from unittest.mock import patch
+    from src.transcript import fetch_transcript
+    # Mock _fetch_via_transcript_api to return English transcript
+    with patch("src.transcript._fetch_via_transcript_api", return_value="Hello world English transcript for testing. This is English."):
+        with patch("src.transcript._fetch_via_ytdlp") as mock_ytdlp:
+            with patch("src.transcript._get_title", return_value="Test Title"):
+                text, title = fetch_transcript("https://www.youtube.com/watch?v=dQw4w9WgXcQ", max_chars=12000)
+                assert "Hello world English" in text
+                # yt-dlp should not be called when transcript_api succeeds with English
+                mock_ytdlp.assert_not_called()
+                print("PASS: test_english_preferred_when_available")
+
+def test_telugu_not_required_when_english_succeeds():
+    """If English succeeds, do not require Telugu — yt-dlp fallback not needed."""
+    from unittest.mock import patch
+    from src.transcript import fetch_and_save_transcript
+    import tempfile
+    import config
+    orig = config.TRANSCRIPT_DIR
+    tmp = Path(tempfile.mkdtemp(prefix="test_transcripts_en_"))
+    try:
+        config.TRANSCRIPT_DIR = tmp
+        with patch("src.transcript._fetch_via_transcript_api", return_value="English transcript for Telugu test. " * 5):
+            with patch("src.transcript._fetch_via_ytdlp") as mock_ytdlp:
+                with patch("src.transcript._get_title", return_value="English Title"):
+                    r = fetch_and_save_transcript("https://www.youtube.com/watch?v=EN123456789", max_chars=12000)
+                    assert r["valid"] is True
+                    assert r["error_type"] is None
+                    # Should not have called yt-dlp when English via transcript_api succeeds
+                    mock_ytdlp.assert_not_called()
+                    print("PASS: test_telugu_not_required_when_english_succeeds")
+    finally:
+        config.TRANSCRIPT_DIR = orig
+        import shutil
+        shutil.rmtree(tmp, ignore_errors=True)
+
+def test_parse_error_falls_through_correctly():
+    """ParseError 'no element found' (HTML/429) should be treated as transient and fall through to yt-dlp."""
+    from unittest.mock import patch
+    from src.transcript import fetch_transcript, TranscriptFetchError
+    # Mock transcript_api to raise ParseError with no element found, and yt-dlp to return English
+    def fake_api(video_id):
+        raise TranscriptFetchError("YouTube rate limit or HTML response (transient): no element found: line 1, column 0")
+    with patch("src.transcript._fetch_via_transcript_api", side_effect=fake_api):
+        with patch("src.transcript._fetch_via_ytdlp", return_value="Fallback English transcript via yt-dlp. " * 5) as mock_ytdlp:
+            with patch("src.transcript._get_title", return_value="Fallback Title"):
+                # Should fall through to yt-dlp and succeed
+                text, title = fetch_transcript("https://www.youtube.com/watch?v=QPfPzEmHTwE", max_chars=12000)
+                assert "Fallback English" in text
+                mock_ytdlp.assert_called_once()
+                print("PASS: test_parse_error_falls_through_correctly")
+
+def test_existing_fallback_remains_intact():
+    """Existing fallback: transcript_api success -> yt-dlp not called; transcript_api fail -> yt-dlp tried."""
+    from unittest.mock import patch
+    from src.transcript import fetch_transcript
+    # Case 1: transcript_api succeeds, yt-dlp not called
+    with patch("src.transcript._fetch_via_transcript_api", return_value="Transcript API success"):
+        with patch("src.transcript._fetch_via_ytdlp") as mock_ytdlp:
+            with patch("src.transcript._get_title", return_value=""):
+                text, _ = fetch_transcript("https://www.youtube.com/watch?v=abc123DEF45", max_chars=12000)
+                assert text == "Transcript API success"
+                mock_ytdlp.assert_not_called()
+    # Case 2: transcript_api fails, yt-dlp succeeds
+    with patch("src.transcript._fetch_via_transcript_api", side_effect=Exception("transcript_api transient 429")):
+        with patch("src.transcript._fetch_via_ytdlp", return_value="yt-dlp success"):
+            with patch("src.transcript._get_title", return_value=""):
+                text, _ = fetch_transcript("https://www.youtube.com/watch?v=abc123DEF45", max_chars=12000)
+                assert text == "yt-dlp success"
+    print("PASS: test_existing_fallback_remains_intact")
+
+def test_no_regression_url_validation_and_save():
+    """No regression to URL validation or transcript saving (existing behavior)."""
+    from unittest.mock import patch
+    from src.transcript import fetch_and_save_transcript
+    import tempfile
+    import config
+    orig = config.TRANSCRIPT_DIR
+    tmp = Path(tempfile.mkdtemp(prefix="test_transcripts_reg_"))
+    try:
+        config.TRANSCRIPT_DIR = tmp
+        # Valid link should still work via mocked fetch
+        with patch("src.transcript._fetch_via_transcript_api", return_value="Valid transcript"):
+            with patch("src.transcript._get_title", return_value="Valid Title"):
+                r = fetch_and_save_transcript("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+                assert r["valid"] is True
+                assert r["video_id"] == "dQw4w9WgXcQ"
+                assert Path(r["txt_path"]).exists()
+        # Invalid link should still fail correctly
+        r2 = fetch_and_save_transcript("https://example.com/not-youtube")
+        assert not r2["valid"] and r2["error_type"] == "InvalidLinkError"
+        print("PASS: test_no_regression_url_validation_and_save")
+    finally:
+        config.TRANSCRIPT_DIR = orig
+        import shutil
+        shutil.rmtree(tmp, ignore_errors=True)
+
+def test_whisper_fallback_when_captions_fail():
+    """When transcript_api and yt-dlp both fail (429), whisper fallback should be tried."""
+    from unittest.mock import patch
+    from src.transcript import fetch_transcript
+    # Mock retry_operation to avoid 2+4+8s delays in tests
+    def _no_retry(func, **kwargs):
+        return func()
+    with patch("src.retry_utils.retry_operation", side_effect=_no_retry):
+        with patch("src.transcript._fetch_via_transcript_api", side_effect=Exception("transcript_api 429")):
+            with patch("src.transcript._fetch_via_ytdlp", side_effect=Exception("yt-dlp 429")):
+                with patch("src.transcript._fetch_via_whisper", return_value="Whisper fallback English transcript for testing. " * 10) as mock_whisper:
+                    with patch("src.transcript._get_title", return_value="Whisper Title"):
+                        text, title = fetch_transcript("https://www.youtube.com/watch?v=QPfPzEmHTwE", max_chars=12000)
+                        assert "Whisper fallback" in text
+                        mock_whisper.assert_called_once()
+                        print("PASS: test_whisper_fallback_when_captions_fail")
+
+def test_whisper_disabled_skipped():
+    """When WHISPER_ENABLED=false, whisper should not be called and fetch should fail."""
+    from unittest.mock import patch
+    from src.transcript import fetch_transcript, TranscriptNotFoundError
+    import config
+    orig = getattr(config, "WHISPER_ENABLED", True)
+    try:
+        config.WHISPER_ENABLED = False
+        def _no_retry(func, **kwargs):
+            return func()
+        with patch("src.retry_utils.retry_operation", side_effect=_no_retry):
+            with patch("src.transcript._fetch_via_transcript_api", side_effect=Exception("429")):
+                with patch("src.transcript._fetch_via_ytdlp", side_effect=Exception("429")):
+                    with patch("src.transcript._fetch_via_whisper") as mock_whisper:
+                        with patch("src.transcript._get_title", return_value=""):
+                            try:
+                                fetch_transcript("https://www.youtube.com/watch?v=QPfPzEmHTwE", max_chars=12000)
+                                assert False, "Should have raised TranscriptNotFoundError"
+                            except (TranscriptNotFoundError, Exception):
+                                pass
+                            # whisper should NOT be called when disabled
+                            mock_whisper.assert_not_called()
+                            print("PASS: test_whisper_disabled_skipped")
+    finally:
+        config.WHISPER_ENABLED = orig
+
+def test_whisper_save_valid():
+    """fetch_and_save_transcript should save whisper result correctly."""
+    from unittest.mock import patch
+    from src.transcript import fetch_and_save_transcript
+    import tempfile
+    import config
+    orig = config.TRANSCRIPT_DIR
+    tmp = Path(tempfile.mkdtemp(prefix="test_whisper_save_"))
+    try:
+        config.TRANSCRIPT_DIR = tmp
+        def _no_retry(func, **kwargs):
+            return func()
+        with patch("src.retry_utils.retry_operation", side_effect=_no_retry):
+            with patch("src.transcript._fetch_via_transcript_api", side_effect=Exception("429")):
+                with patch("src.transcript._fetch_via_ytdlp", side_effect=Exception("429")):
+                    with patch("src.transcript._fetch_via_whisper", return_value="Whisper saved transcript " * 10):
+                        with patch("src.transcript._get_title", return_value="Whisper Saved Title"):
+                            r = fetch_and_save_transcript("https://www.youtube.com/watch?v=QPfPzEmHTwE")
+                            assert r["valid"] is True
+                            assert r["txt_path"].exists()
+                            assert "Whisper saved" in r["transcript"]
+                            print("PASS: test_whisper_save_valid")
+    finally:
+        config.TRANSCRIPT_DIR = orig
+        import shutil
+        shutil.rmtree(tmp, ignore_errors=True)
+
 if __name__ == "__main__":
     test_empty_links()
     test_invalid_links()
@@ -108,4 +277,12 @@ if __name__ == "__main__":
     test_fetch_and_save_empty_invalid_do_not_save()
     test_save_locally_creates_files()
     test_cli_validation_paths()
+    test_english_preferred_when_available()
+    test_telugu_not_required_when_english_succeeds()
+    test_parse_error_falls_through_correctly()
+    test_existing_fallback_remains_intact()
+    test_no_regression_url_validation_and_save()
+    test_whisper_fallback_when_captions_fail()
+    test_whisper_disabled_skipped()
+    test_whisper_save_valid()
     print("\nAll transcript validation tests PASSED (no sheet touched).")

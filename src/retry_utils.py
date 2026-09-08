@@ -38,6 +38,7 @@ TRANSIENT_SUBSTRINGS = [
     "429",
     "Too Many Requests",
     "rateLimitExceeded",
+    "rate limit",  # for YouTube HTML 429 with "rate limit" text
     "quotaExceeded",
     "500",
     "502",
@@ -60,6 +61,8 @@ TRANSIENT_SUBSTRINGS = [
     "HttpError 502",
     "HttpError 503",
     "HttpError 504",
+    "no element found",  # youtube-transcript-api ParseError when YouTube returns HTML 429
+    "ParseError",  # same
 ]
 
 def is_transient_error(exc: Exception) -> bool:
