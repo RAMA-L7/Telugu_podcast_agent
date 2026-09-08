@@ -291,6 +291,311 @@ def run_transcript_pipeline(dry_run: bool = False, limit: Optional[int] = None, 
     log.info("Transcript pipeline complete: %d done, %d failed (dry_run=%s)", summary["done"], summary["failed"], dry_run)
     return summary
 
+# ---------------------------------------------------------------------------
+# Phase 4 Milestone 2: Audio pipeline — Transcript/Script -> Piper TTS -> Drive -> Audio Link
+# ---------------------------------------------------------------------------
+def _audio_output_path(video_id: str, title: str = "", row_id: str = "") -> Path:
+    """Deterministic, safe MP3 path for audio pipeline.
+
+    - MP3 extension, filesystem-safe via slugify, avoids overwriting where possible
+    - Uses video_id as primary identity (YouTube ID 11 chars, safe), plus slugified title/row_id for readability
+    - Follows existing output_paths convention but deterministic (no date) for sheet pipeline idempotency
+    - Stored under config.OUTPUT_DIR (output/*.mp3, gitignored)
+    """
+    from src.utils import slugify
+    import re
+    # Base is video_id, optionally with row_id and slugified title for identity
+    base = video_id.strip()
+    if row_id and row_id.strip():
+        # Row ID first for sheet traceability, but keep video_id primary
+        base = f"{row_id.strip()}_{base}"
+    if title and title.strip():
+        # Avoid raw arbitrary titles: slugify, max 20 chars, filesystem-safe
+        base += f"_{slugify(title.strip(), 20)}"
+    # Extra safety: replace any remaining unsafe chars
+    base = re.sub(r"[^\w\-]", "_", base)
+    # Avoid empty or too long
+    base = base[:80] or video_id
+    return config.OUTPUT_DIR / f"{base}.mp3"
+
+def _is_valid_audio_link(link: str) -> bool:
+    """Check if Audio Link is a valid Drive webViewLink (for idempotency)."""
+    link = (link or "").strip()
+    return link.startswith("http") and "drive.google.com" in link
+
+def fetch_audio_pending_rows(ws=None) -> List[Dict]:
+    """Fetch rows ready for audio generation/upload.
+
+    Idempotency: skip rows where Status == AUDIO_DONE and Audio Link is valid Drive link.
+    Pending if Status in (TRANSCRIPT_DONE, AUDIO_FAILED) — AUDIO_FAILED is retryable.
+    Uses exact 12-col schema, no header change.
+
+    Returns list of dicts with row_num, status, record, url, youtube_link, id, title, audio_link.
+    """
+    ws = ws or get_sheet()
+    records = ws.get_all_records()
+    pending = []
+    for idx, row in enumerate(records, start=2):
+        status = str(row.get("Status", "")).strip().upper()
+        audio_link = str(row.get("Audio Link", "")).strip()
+        # Idempotency: already AUDIO_DONE with valid link → skip
+        if status == "AUDIO_DONE" and _is_valid_audio_link(audio_link):
+            continue
+        # Pending: transcript done, or previous audio failed (retryable)
+        if status in ("TRANSCRIPT_DONE", "AUDIO_FAILED"):
+            yt_link = str(row.get("YouTube Link", "")).strip()
+            pending.append({
+                "row_num": idx,
+                "status": status,
+                "record": row,
+                "url": yt_link,
+                "youtube_link": yt_link,
+                "id": str(row.get("ID", "")).strip(),
+                "title": str(row.get("Title", "")).strip(),
+                "audio_link": audio_link,
+                "transcript_link": str(row.get("Transcript Link", "")).strip(),
+            })
+    return pending
+
+def process_audio_row(ws, row: Dict, dry_run: bool = False) -> Dict:
+    """Process one row: Transcript -> Telugu script -> Piper TTS -> Drive upload -> Sheet Audio Link.
+
+    Failure handling (critical):
+      - TTS succeeds but Drive fails: Do NOT write fake/empty Audio Link, do NOT overwrite valid existing Audio Link,
+        Status=AUDIO_FAILED, Error=Drive failure, Updated At=IST, preserve valid fields.
+      - TTS fails: do NOT attempt Drive, Error=TTS failure, Status=AUDIO_FAILED, Updated At, preserve links.
+      - Sheet update fails after Drive success: do NOT claim success, preserve Drive result in return/log, raise.
+
+    Idempotency: if Status==AUDIO_DONE and valid Audio Link, skip (no regeneration/upload).
+    Only mark AUDIO_DONE after BOTH MP3 generation AND Drive upload AND Sheet update succeed.
+
+    Do NOT overwrite valid existing fields unnecessarily.
+
+    Returns result dict with row_num, status, audio_link, fileId, error, etc.
+    """
+    from src.utils import extract_video_id
+
+    row_num = row["row_num"]
+    yt_link = row.get("youtube_link", row.get("url", "")) or str(row.get("record", {}).get("YouTube Link", "")).strip()
+    record = row.get("record", {})
+    orig_status = str(record.get("Status", "")).strip()
+    status_upper = orig_status.strip().upper()
+    audio_link_existing = str(record.get("Audio Link", "")).strip()
+    title = str(record.get("Title", "")).strip() or row.get("title", "")
+    row_id = str(record.get("ID", "")).strip() or row.get("id", "")
+    transcript_link = str(record.get("Transcript Link", "")).strip() or row.get("transcript_link", "")
+
+    log.info("Audio Row %d (Status=%s, Audio Link=%s) -> YouTube Link=%r", row_num, orig_status, audio_link_existing[:40], yt_link)
+
+    # Idempotency: already AUDIO_DONE with valid link -> skip
+    if status_upper == "AUDIO_DONE" and _is_valid_audio_link(audio_link_existing):
+        log.info("Row %d already AUDIO_DONE with valid Audio Link, skipping", row_num)
+        return {"row_num": row_num, "youtube_link": yt_link, "status": "AUDIO_DONE", "skipped": True, "audio_link": audio_link_existing, "valid": True}
+
+    timestamp = _ist_timestamp()
+
+    # Validate YouTube Link and extract video_id for deterministic MP3 filename
+    video_id = extract_video_id(yt_link)
+    if not video_id:
+        err = f"Invalid YouTube Link: {yt_link!r}"
+        log.warning("Row %d AUDIO_FAILED [InvalidLink] %s", row_num, err)
+        if dry_run:
+            log.info("[DRY-RUN] Row %d would -> AUDIO_FAILED | Error=[InvalidLink] %s | Updated At=%s", row_num, err[:80], timestamp)
+            return {"row_num": row_num, "youtube_link": yt_link, "status": "AUDIO_FAILED", "valid": False, "dry_run": True, "would_status": "AUDIO_FAILED", "error": err, "error_type": "InvalidLink"}
+        # Do NOT overwrite Audio Link
+        try:
+            ws.update_cell(row_num, _col_index("Error"), f"[InvalidLink] {err}"[:300])
+            ws.update_cell(row_num, _col_index("Status"), "AUDIO_FAILED")
+            ws.update_cell(row_num, _col_index("Updated At"), timestamp)
+        except Exception as e:
+            log.exception("Row %d sheet update failed for InvalidLink: %s", row_num, e)
+            raise
+        return {"row_num": row_num, "youtube_link": yt_link, "status": "AUDIO_FAILED", "valid": False, "error": err, "error_type": "InvalidLink", "timestamp": timestamp}
+
+    # Load transcript: prefer local file output/transcripts/<video_id>.txt (from transcript pipeline)
+    transcript_text = ""
+    transcript_path = config.TRANSCRIPT_DIR / f"{video_id}.txt"
+    if transcript_path.exists():
+        try:
+            transcript_text = transcript_path.read_text(encoding="utf-8").strip()
+        except Exception as e:
+            log.warning("Row %d transcript read failed %s: %s", row_num, transcript_path, e)
+    # Fallback: try Transcript Link if it's a local path
+    if not transcript_text and transcript_link:
+        try:
+            p = Path(transcript_link)
+            # Transcript Link may be relative like output/transcripts/...; resolve against BASE_DIR
+            if not p.is_absolute():
+                p = config.BASE_DIR / p
+            if p.exists():
+                transcript_text = p.read_text(encoding="utf-8").strip()
+        except Exception:
+            pass
+    if not transcript_text:
+        err = f"Transcript not found for video_id={video_id} (need TRANSCRIPT_DONE with local {transcript_path})"
+        log.warning("Row %d AUDIO_FAILED [TranscriptMissing] %s", row_num, err)
+        if dry_run:
+            log.info("[DRY-RUN] Row %d would -> AUDIO_FAILED | Error=[TranscriptMissing] %s | Updated At=%s", row_num, err[:80], timestamp)
+            return {"row_num": row_num, "youtube_link": yt_link, "status": "AUDIO_FAILED", "valid": False, "dry_run": True, "would_status": "AUDIO_FAILED", "error": err, "error_type": "TranscriptMissing"}
+        # Preserve Audio Link, set failure
+        try:
+            ws.update_cell(row_num, _col_index("Error"), f"[TranscriptMissing] {err}"[:300])
+            ws.update_cell(row_num, _col_index("Status"), "AUDIO_FAILED")
+            ws.update_cell(row_num, _col_index("Updated At"), timestamp)
+        except Exception as e:
+            log.exception("Row %d sheet update failed for TranscriptMissing: %s", row_num, e)
+            raise
+        return {"row_num": row_num, "youtube_link": yt_link, "status": "AUDIO_FAILED", "valid": False, "error": err, "error_type": "TranscriptMissing", "timestamp": timestamp}
+
+    # Dry-run: simulate without side effects (no MP3, no Drive, no sheet write)
+    if dry_run:
+        mp3_path = _audio_output_path(video_id, title, row_id)
+        fake_link = f"dry-run://{mp3_path.name}"
+        log.info("[DRY-RUN] Row %d would -> AUDIO_DONE | Audio Link=%s | mp3=%s | Updated At=%s", row_num, fake_link, mp3_path, timestamp)
+        return {"row_num": row_num, "youtube_link": yt_link, "status": "AUDIO_DONE", "valid": True, "dry_run": True, "would_status": "AUDIO_DONE", "audio_link": fake_link, "mp3_path": str(mp3_path), "video_id": video_id, "timestamp": timestamp}
+
+    # Generate Telugu script (existing abstraction, rule-based fallback preserved)
+    try:
+        from src.script_generator import generate_telugu_script
+        script = generate_telugu_script(transcript_text, title=title)
+        if not script or len(script) < 2:
+            raise ValueError(f"Script generation returned invalid script: {script}")
+    except Exception as e:
+        err = f"Script generation failed: {e}"
+        log.warning("Row %d AUDIO_FAILED [ScriptFailed] %s", row_num, err)
+        try:
+            ws.update_cell(row_num, _col_index("Error"), f"[ScriptFailed] {err}"[:300])
+            ws.update_cell(row_num, _col_index("Status"), "AUDIO_FAILED")
+            ws.update_cell(row_num, _col_index("Updated At"), timestamp)
+        except Exception as sheet_e:
+            log.exception("Row %d sheet update failed for ScriptFailed: %s", row_num, sheet_e)
+            raise
+        return {"row_num": row_num, "youtube_link": yt_link, "status": "AUDIO_FAILED", "valid": False, "error": err, "error_type": "ScriptFailed", "timestamp": timestamp}
+
+    # Generate MP3 via existing TTS (Piper primary, Anjali→padmavathi, Ravi→venkatesh)
+    mp3_path = _audio_output_path(video_id, title, row_id)
+    try:
+        from src.tts import generate_podcast_mp3
+        mp3_path.parent.mkdir(parents=True, exist_ok=True)
+        log.info("Row %d generating MP3 via piper: %s -> %s (%d turns)", row_num, video_id, mp3_path, len(script))
+        generate_podcast_mp3(script, mp3_path)
+        if not mp3_path.exists() or mp3_path.stat().st_size == 0:
+            raise RuntimeError(f"MP3 not created or empty: {mp3_path}")
+    except Exception as e:
+        err = f"TTS failed: {e}"
+        log.warning("Row %d AUDIO_FAILED [TTSFailed] %s", row_num, err)
+        try:
+            ws.update_cell(row_num, _col_index("Error"), f"[TTSFailed] {err}"[:300])
+            ws.update_cell(row_num, _col_index("Status"), "AUDIO_FAILED")
+            ws.update_cell(row_num, _col_index("Updated At"), timestamp)
+        except Exception as sheet_e:
+            log.exception("Row %d sheet update failed for TTSFailed: %s", row_num, sheet_e)
+            raise
+        # Do NOT attempt Drive upload
+        return {"row_num": row_num, "youtube_link": yt_link, "status": "AUDIO_FAILED", "valid": False, "error": err, "error_type": "TTSFailed", "timestamp": timestamp, "mp3_path": str(mp3_path)}
+
+    # Drive upload (personal Gmail OAuth, secure make_public=False, uses DRIVE_OUTPUT_FOLDER_ID)
+    try:
+        from src.drive_uploader import upload_to_drive, DriveError
+        log.info("Row %d uploading MP3 to Drive: %s", row_num, mp3_path)
+        drive_result = upload_to_drive(mp3_path, make_public=False)
+        # drive_result is dict {fileId, webViewLink}
+        if isinstance(drive_result, dict):
+            file_id = drive_result.get("fileId") or drive_result.get("id")
+            web_view_link = drive_result.get("webViewLink") or drive_result.get("link")
+        else:
+            # Backward compat: string link
+            web_view_link = str(drive_result)
+            file_id = None
+            import re as _re
+            m = _re.search(r"/d/([a-zA-Z0-9_-]+)", web_view_link)
+            if m:
+                file_id = m.group(1)
+        if not web_view_link or not web_view_link.startswith("http") or "drive.google.com" not in web_view_link:
+            raise DriveError(f"Invalid Drive link returned: {web_view_link!r} (fileId={file_id})")
+    except Exception as e:
+        # Drive upload failure: Do NOT write fake/empty Audio Link, do NOT overwrite valid existing Audio Link
+        err = f"Drive upload failed: {e}"
+        log.warning("Row %d AUDIO_FAILED [DriveFailed] %s (mp3 preserved at %s)", row_num, err, mp3_path)
+        try:
+            ws.update_cell(row_num, _col_index("Error"), f"[DriveFailed] {err}"[:300])
+            ws.update_cell(row_num, _col_index("Status"), "AUDIO_FAILED")
+            ws.update_cell(row_num, _col_index("Updated At"), timestamp)
+        except Exception as sheet_e:
+            log.exception("Row %d sheet update failed for DriveFailed: %s", row_num, sheet_e)
+            # Preserve Drive result in return for visibility, but sheet update failed
+            raise RuntimeError(f"Drive upload failed and sheet update also failed: {e} / sheet: {sheet_e}") from sheet_e
+        return {"row_num": row_num, "youtube_link": yt_link, "status": "AUDIO_FAILED", "valid": False, "error": err, "error_type": "DriveFailed", "timestamp": timestamp, "mp3_path": str(mp3_path), "drive_error": str(e)}
+
+    # Sheet update: only after BOTH MP3 and Drive succeed
+    try:
+        # Use same timestamp for all updates in this row
+        # Update Audio Link with webViewLink (do NOT construct manually when valid webViewLink returned)
+        ws.update_cell(row_num, _col_index("Audio Link"), web_view_link)
+        ws.update_cell(row_num, _col_index("Error"), "")
+        ws.update_cell(row_num, _col_index("Status"), "AUDIO_DONE")
+        ws.update_cell(row_num, _col_index("Updated At"), timestamp)
+        log.info("Row %d -> AUDIO_DONE (Drive %s, mp3 %s)", row_num, file_id, mp3_path)
+        return {"row_num": row_num, "youtube_link": yt_link, "status": "AUDIO_DONE", "valid": True, "audio_link": web_view_link, "fileId": file_id, "mp3_path": str(mp3_path), "video_id": video_id, "timestamp": timestamp}
+    except Exception as e:
+        # Sheet update failed after Drive success: do NOT claim success, preserve Drive result, raise
+        err = f"Sheet update failed after Drive upload: {e}"
+        log.exception("Row %d Drive upload succeeded (%s) but Sheet update failed: %s", row_num, web_view_link, e)
+        # Preserve Drive result in return for visibility
+        raise RuntimeError(f"{err} (Drive succeeded: {web_view_link} fileId={file_id})") from e
+
+def run_audio_pipeline(dry_run: bool = False, limit: Optional[int] = None, ws=None) -> Dict:
+    """Run audio pipeline for rows needing TTS + Drive upload.
+
+    - Fetches pending via fetch_audio_pending_rows() (TRANSCRIPT_DONE/AUDIO_FAILED, skips AUDIO_DONE+valid link)
+    - For each, calls process_audio_row (dry_run logs without writes)
+    - Returns summary dict.
+
+    Idempotency: skips AUDIO_DONE with valid Audio Link; failed rows retryable.
+    Does NOT touch transcript logic; reuses existing TTS/Drive abstractions.
+    """
+    ws = ws or get_sheet()
+    header = ws.row_values(1)
+    if header != config.SHEET_HEADER:
+        log.warning("Header mismatch for audio pipeline — continuing without modification. Expected %s", config.SHEET_HEADER)
+    pending = fetch_audio_pending_rows(ws)
+    log.info("Audio pipeline: %d rows with Status TRANSCRIPT_DONE/AUDIO_FAILED (skipping AUDIO_DONE+valid link)", len(pending))
+    if limit is not None:
+        pending = pending[:limit]
+        log.info("Limited to first %d rows", limit)
+    summary = {
+        "header": header,
+        "total_pending": len(pending),
+        "processed": 0,
+        "done": 0,
+        "failed": 0,
+        "skipped": 0,
+        "dry_run": dry_run,
+        "details": [],
+    }
+    if not pending:
+        log.info("No rows to process for audio (need TRANSCRIPT_DONE/AUDIO_FAILED with transcript)")
+        return summary
+    for row in pending:
+        # Check idempotency again to count skipped separately (should have been filtered, but keep)
+        try:
+            res = process_audio_row(ws, row, dry_run=dry_run)
+            summary["details"].append(res)
+            summary["processed"] += 1
+            if res.get("skipped"):
+                summary["skipped"] += 1
+            elif res.get("valid") and res.get("status") == "AUDIO_DONE":
+                summary["done"] += 1
+            else:
+                summary["failed"] += 1
+        except Exception as e:
+            log.exception("Unexpected error processing audio row %d: %s", row["row_num"], e)
+            summary["details"].append({"row_num": row["row_num"], "valid": False, "error": str(e), "error_type": "Unexpected", "status": "AUDIO_FAILED"})
+            summary["failed"] += 1
+            summary["processed"] += 1
+    log.info("Audio pipeline complete: %d done, %d failed, %d skipped (dry_run=%s)", summary["done"], summary["failed"], summary["skipped"], dry_run)
+    return summary
+
 def update_row(ws, row_num: int, status: str = "", drive_link: str = "", title: str = "", updated_at: str = "", error: str = "", **kwargs):
     """Update row by exact 12-column header names.
 

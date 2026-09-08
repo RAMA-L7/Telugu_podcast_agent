@@ -102,7 +102,8 @@ def main():
     parser.add_argument("--poll-interval", type=int, default=None, help="Override POLL_INTERVAL_SECONDS")
     parser.add_argument("--test-sheet", action="store_true", help="Sheet connection test: NEW -> TEST_OK + Updated At (no transcript/audio)")
     parser.add_argument("--run-transcripts", action="store_true", help="Milestone 3: process rows NEW/TEST_OK -> fetch transcript -> TRANSCRIPT_DONE/FAILED (use --dry-run to preview)")
-    parser.add_argument("--limit", type=int, default=None, help="Limit rows processed (with --run-transcripts/--test-sheet)")
+    parser.add_argument("--run-audio", action="store_true", help="Phase 4 Milestone 2: process rows TRANSCRIPT_DONE/SCRIPT_DONE/AUDIO_FAILED -> Piper TTS -> Drive OAuth upload -> AUDIO_DONE/AUDIO_FAILED (use --dry-run to preview, --limit 1)")
+    parser.add_argument("--limit", type=int, default=None, help="Limit rows processed (with --run-transcripts/--run-audio/--test-sheet)")
     args = parser.parse_args()
 
     # Sheet connection test mode (focused step, no transcript/audio)
@@ -131,6 +132,22 @@ def main():
                 print(f"  Row {rid}: TRANSCRIPT_DONE vid={d.get('video_id')} -> {d.get('transcript_link')}")
             else:
                 print(f"  Row {rid}: TRANSCRIPT_FAILED [{d.get('error_type')}] {str(d.get('error',''))[:100]}")
+        return
+
+    # Phase 4 Milestone 2: audio pipeline (TTS + Drive -> Audio Link)
+    if args.run_audio:
+        from src.sheet_monitor import run_audio_pipeline
+        summary = run_audio_pipeline(dry_run=args.dry_run, limit=args.limit)
+        print("\n=== Audio Pipeline Result ===")
+        print(f"Pending (TRANSCRIPT_DONE/SCRIPT_DONE/AUDIO_FAILED): {summary['total_pending']} | Done: {summary['done']} | Failed: {summary['failed']} | Skipped: {summary['skipped']} | dry_run={summary['dry_run']}")
+        for d in summary["details"]:
+            rid = d.get("row_num")
+            if d.get("skipped"):
+                print(f"  Row {rid}: SKIPPED (already AUDIO_DONE {d.get('audio_link','')[:50]})")
+            elif d.get("valid") and d.get("status") == "AUDIO_DONE":
+                print(f"  Row {rid}: AUDIO_DONE -> {d.get('audio_link')} (mp3 {d.get('mp3_path','')})")
+            else:
+                print(f"  Row {rid}: AUDIO_FAILED [{d.get('error_type')}] {str(d.get('error',''))[:100]}")
         return
 
     # Single URL mode
